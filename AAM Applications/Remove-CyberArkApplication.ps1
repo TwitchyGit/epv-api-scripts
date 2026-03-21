@@ -133,7 +133,7 @@ $exitCode = 0
 $sessionToken = $null
 $shouldLogoff = $true
 $plainPassword = $null
-$headers = @()
+$headers = @{}
 
 # Normalize URL once at the start
 $PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
