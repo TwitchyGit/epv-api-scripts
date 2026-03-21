@@ -270,9 +270,8 @@ function Invoke-CyberArkRest {
     }
 }
 
-# -------------------------------------------------------------------
+
 # Initial state
-# -------------------------------------------------------------------
 $exitCode = 0
 $sessionToken = $null
 $shouldLogoff = $true
@@ -283,9 +282,8 @@ $authMethodsToAdd = @()
 # Normalize URL once at the start
 $PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
 
-# -------------------------------------------------------------------
+
 # Basic validation
-# -------------------------------------------------------------------
 if ([string]::IsNullOrWhiteSpace($AppID)) {
     Write-Log 'ERROR' 'AppID cannot be blank.'
     exit 1
@@ -302,13 +300,13 @@ if ($AuthenticationType -eq 'radius' -and [string]::IsNullOrWhiteSpace($OTP)) {
     exit 1
 }
 
-# -------------------------------------------------------------------
+
 # Optional certificate validation bypass
-# -------------------------------------------------------------------
 if ($DisableCertificateValidation) {
     Write-Log 'WARN' 'Certificate validation is disabled. Use only for testing.'
 
-    Add-Type @"
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type @"
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 public class TrustAllCertsPolicy : ICertificatePolicy {
@@ -321,6 +319,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     }
 }
 "@
+    }
 
     [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 }
@@ -330,9 +329,7 @@ if (([Net.ServicePointManager]::SecurityProtocol -band [Net.SecurityProtocolType
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 }
 
-# -------------------------------------------------------------------
 # Build requested authentication methods
-# -------------------------------------------------------------------
 
 # Path authentication
 if ($Path) {
@@ -452,9 +449,8 @@ if ($CertificateIssuer -or $CertificateSubject -or $CertificateSubjectAlternativ
     }
 }
 
-# -------------------------------------------------------------------
+
 # Authentication / session handling
-# -------------------------------------------------------------------
 if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
     # Reuse caller-provided token
     $sessionToken = $LogonToken.Trim()
@@ -524,9 +520,8 @@ $appIdEncoded = [uri]::EscapeDataString($AppID)
 $appUrl = "{0}/WebServices/PIMServices.svc/Applications/{1}/" -f $PVWAUrl, $appIdEncoded
 $getAuthUrl = "{0}/WebServices/PIMServices.svc/Applications/{1}/Authentications/" -f $PVWAUrl, $appIdEncoded
 
-# -------------------------------------------------------------------
+
 # Validate application exists
-# -------------------------------------------------------------------
 try {
     Write-Log 'INFO' ("Validating application '{0}' exists..." -f $AppID)
     $null = Invoke-CyberArkRest -Uri $appUrl -Method Get -Headers $headers
@@ -544,9 +539,8 @@ if ($exitCode -eq 0 -and $authMethodsToAdd.Count -eq 0) {
     Write-Log 'INFO' 'No authentication methods were specified. Verification only completed successfully.'
 }
 
-# -------------------------------------------------------------------
+
 # Read existing authentication methods
-# -------------------------------------------------------------------
 $existingAuthMethods = @{ authentication = @() }
 
 if ($exitCode -eq 0 -and $authMethodsToAdd.Count -gt 0) {
@@ -567,9 +561,8 @@ if ($exitCode -eq 0 -and $authMethodsToAdd.Count -gt 0) {
     }
 }
 
-# -------------------------------------------------------------------
+
 # Add authentication methods
-# -------------------------------------------------------------------
 $addedAuths = @()
 $skippedAuths = @()
 $failedAuths = @()
@@ -642,9 +635,8 @@ if ($exitCode -eq 0 -and $authMethodsToAdd.Count -gt 0) {
     }
 }
 
-# -------------------------------------------------------------------
+
 # Summary
-# -------------------------------------------------------------------
 Write-Output ''
 Write-Output ('=' * 80)
 Write-Output 'SUMMARY'
@@ -675,9 +667,8 @@ if ($failedAuths.Count -gt 0) {
     $exitCode = 1
 }
 
-# -------------------------------------------------------------------
+
 # Display updated authentication list
-# -------------------------------------------------------------------
 if ($exitCode -eq 0 -and $addedAuths.Count -gt 0) {
     try {
         Write-Log 'INFO' 'Retrieving updated authentication methods...'
@@ -724,9 +715,8 @@ if ($exitCode -eq 0 -and $addedAuths.Count -gt 0) {
     }
 }
 
-# -------------------------------------------------------------------
+
 # Logoff if we created the session
-# -------------------------------------------------------------------
 if ($shouldLogoff -and -not [string]::IsNullOrWhiteSpace($sessionToken)) {
     try {
         Write-Log 'INFO' 'Logging off...'
