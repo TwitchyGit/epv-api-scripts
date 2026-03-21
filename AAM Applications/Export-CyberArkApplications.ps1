@@ -8,7 +8,7 @@
     Works with both Privilege Cloud and Self-Hosted PAM.
 
 .PARAMETER PVWAUrl
-    The base URL of the PVWA (e.g., https://pvwa.company.com or https://tenant.privilegecloud.cyberark.cloud)
+    The base URL of the PVWA (e.g. https://pvwa.company.com or https://tenant.privilegecloud.cyberark.cloud)
 
 .PARAMETER AppID
     Optional. Filter export to a specific application ID
@@ -25,7 +25,7 @@
 .PARAMETER OTP
     One-time password for RADIUS authentication
 
-.PARAMETER logonToken
+.PARAMETER LogonToken
     Pre-existing session token. If provided, script will NOT log off at the end
     Aliases: session, sessionToken
 
@@ -41,18 +41,16 @@
     Exports a specific application
 
 .EXAMPLE
-    .\Export-CyberArkApplications.ps1 -PVWAUrl "https://tenant.privilegecloud.cyberark.cloud" -logonToken $token -CSVPath ".\apps.csv"
-    Exports using existing session token (Privilege Cloud)
+    .\Export-CyberArkApplications.ps1 -PVWAUrl "https://tenant.privilegecloud.cyberark.cloud" -LogonToken $token -CSVPath ".\apps.csv"
+    Exports using existing session token
 
 .NOTES
-    Author: CyberArk
-    Version: 2.0
-    Requires: PowerShell 5.1 or higher, CyberArk PAS v10.4+
+    PowerShell 5.1 compatible
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, HelpMessage = "PVWA URL (e.g., https://pvwa.company.com)")]
+    [Parameter(Mandatory = $true, HelpMessage = "PVWA URL (e.g. https://pvwa.company.com)")]
     [Alias("url")]
     [ValidateNotNullOrEmpty()]
     [string]$PVWAUrl,
@@ -78,333 +76,416 @@ param(
 
     [Parameter(Mandatory = $false)]
     [Alias("session", "sessionToken")]
-    $logonToken,
+    [string]$LogonToken,
 
     [Parameter(Mandatory = $false)]
     [switch]$DisableCertificateValidation
 )
 
 #region Helper Functions
-Function Write-LogMessage {
+function Write-LogMessage {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Message,
+
         [Parameter(Mandatory = $false)]
-        [ValidateSet("Info", "Warning", "Error", "Debug", "Verbose")]
-        [string]$Type = "Info"
+        [ValidateSet("INFO", "WARN", "ERROR")]
+        [string]$Type = "INFO"
     )
 
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMessage = "[$timestamp] [$Type] $Message"
-
-    switch ($Type) {
-        "Info" { Write-Host $Message }
-        "Warning" { Write-Warning $Message }
-        "Error" { Write-Host $Message -ForegroundColor Red }
-        "Debug" { if ($PSCmdlet.MyInvocation.BoundParameters["Debug"]) { Write-Debug $Message } }
-        "Verbose" { if ($PSCmdlet.MyInvocation.BoundParameters["Verbose"]) { Write-Verbose $Message } }
-    }
+    # Simple output suitable for script logs and schedulers
+    Write-Output ("{0} {1}" -f $Type.PadRight(5), $Message)
 }
 
-Function ConvertTo-URL {
-    param([string]$text)
-    if (![string]::IsNullOrEmpty($text)) {
-        return [URI]::EscapeDataString($text)
+function ConvertTo-URL {
+    param(
+        [string]$Text
+    )
+
+    # Encode values for safe inclusion in URLs
+    if (-not [string]::IsNullOrWhiteSpace($Text)) {
+        return [URI]::EscapeDataString($Text)
     }
-    return $text
+
+    return $Text
 }
 
-Function Convert-ObjectToString {
-    param([PSCustomObject]$Object)
+function Convert-SecureStringToPlainText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.SecureString]$SecureString
+    )
 
+    # Convert SecureString for API authentication
+    # BSTR is zeroed immediately after use
+    $bstr = $null
+    $plainText = $null
+
+    try {
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+        $plainText = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    } finally {
+        if ($bstr) {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+    }
+
+    return $plainText
+}
+
+function Convert-ObjectToString {
+    param(
+        [Parameter(Mandatory = $false)]
+        [psobject]$Object
+    )
+
+    # Flatten an authentication object into a single string for CSV export
     $retString = [string]::Empty
+
     if ($null -ne $Object) {
         $arrItems = @()
+
         $Object.PSObject.Properties | ForEach-Object {
-            # Skip authID, authenticationID, AppID, and empty values
-            if ($_.Name -notin @('authID', 'authenticationID', 'AppID') -and ![string]::IsNullOrEmpty($_.Value)) {
+            # Skip IDs and blank values
+            if ($_.Name -notin @("authID", "authenticationID", "AppID") -and $null -ne $_.Value -and -not [string]::IsNullOrWhiteSpace([string]$_.Value)) {
                 $value = $_.Value
-                # Handle arrays - join with comma (no spaces)
-                if ($value -is [Array]) {
-                    # Trim each element and join without spaces
-                    $value = ($value | ForEach-Object { $_.Trim() }) -join ','
+
+                if ($value -is [array]) {
+                    # Trim array elements and join without spaces
+                    $value = ($value | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -ne "" }) -join ","
                 } else {
-                    # For string values, remove spaces after commas (API may return formatted strings)
-                    $value = $value -replace ',\s+', ','
+                    # Trim and remove spaces after commas for consistency
+                    $value = ([string]$value).Trim() -replace ",\s+", ","
                 }
-                $arrItems += "$($_.Name)=$value"
+
+                $arrItems += ("{0}={1}" -f $_.Name, $value)
             }
         }
-        $retString = $arrItems -join ';'
+
+        $retString = $arrItems -join ";"
     }
+
     return $retString
 }
 
-Function Initialize-SSL {
+function Initialize-SSL {
+    # Optional certificate trust bypass for test environments only
     if ($DisableCertificateValidation) {
-        Write-LogMessage -Type Warning -Message "SSL certificate validation is disabled"
-        if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Write-LogMessage -Type WARN -Message "SSL certificate validation is disabled. Use only for testing."
+
+        if (-not ([System.Management.Automation.PSTypeName]"TrustAllCertsPolicy").Type) {
             Add-Type @"
-                using System.Net;
-                using System.Security.Cryptography.X509Certificates;
-                public class TrustAllCertsPolicy : ICertificatePolicy {
-                    public bool CheckValidationResult(
-                        ServicePoint srvPoint, X509Certificate certificate,
-                        WebRequest request, int certificateProblem) {
-                        return true;
-                    }
-                }
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint,
+        X509Certificate certificate,
+        WebRequest request,
+        int certificateProblem) {
+        return true;
+    }
+}
 "@
         }
+
         [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
     }
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+    # Ensure TLS 1.2 is enabled without wiping other flags
+    if (([System.Net.ServicePointManager]::SecurityProtocol -band [System.Net.SecurityProtocolType]::Tls12) -eq 0) {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+    }
 }
 
-Function Invoke-PASRestMethod {
+function Invoke-PASRestMethod {
     param(
         [Parameter(Mandatory = $true)]
         [ValidateSet("GET", "POST", "DELETE", "PATCH")]
         [string]$Method,
+
         [Parameter(Mandatory = $true)]
         [string]$URI,
+
         [Parameter(Mandatory = $true)]
         [hashtable]$Header,
+
         [Parameter(Mandatory = $false)]
         [string]$Body
     )
 
+    # Wrapper for consistent REST behaviour and error handling
     try {
-        Write-LogMessage -Type Verbose -Message "$Method $URI"
         $params = @{
             Uri         = $URI
             Method      = $Method
             Headers     = $Header
             ContentType = "application/json"
             TimeoutSec  = 2700
+            ErrorAction = "Stop"
         }
 
-        if (![string]::IsNullOrEmpty($Body)) {
+        if (-not [string]::IsNullOrWhiteSpace($Body)) {
             $params.Body = $Body
-            Write-LogMessage -Type Debug -Message "Body: $Body"
         }
 
-        $response = Invoke-RestMethod @params
-        return $response
-    }
-    catch {
-        Write-LogMessage -Type Error -Message "REST API call failed: $($_.Exception.Message)"
+        return Invoke-RestMethod @params
+    } catch {
+        Write-LogMessage -Type ERROR -Message ("REST API call failed: {0}" -f $_.Exception.Message)
+
         if ($_.Exception.Response) {
-            Write-LogMessage -Type Error -Message "Status Code: $($_.Exception.Response.StatusCode.value__)"
-            Write-LogMessage -Type Error -Message "Status Description: $($_.Exception.Response.StatusDescription)"
+            try {
+                Write-LogMessage -Type ERROR -Message ("Status Code: {0}" -f $_.Exception.Response.StatusCode.value__)
+                Write-LogMessage -Type ERROR -Message ("Status Description: {0}" -f $_.Exception.Response.StatusDescription)
+            } catch {
+                Write-LogMessage -Type ERROR -Message "Could not extract HTTP status details."
+            }
         }
+
         throw
     }
 }
 
-Function Get-PASLogonHeader {
+function Get-PASLogonHeader {
     param(
         [Parameter(Mandatory = $true)]
         [PSCredential]$Credential,
+
         [Parameter(Mandatory = $true)]
         [string]$BaseURL,
+
         [Parameter(Mandatory = $true)]
         [string]$AuthType,
+
         [Parameter(Mandatory = $false)]
         [string]$OTP
     )
 
-    $logonURL = "$BaseURL/api/auth/$AuthType/Logon"
-    $logonBody = @{
-        username = $Credential.UserName
-        password = $Credential.GetNetworkCredential().Password
-    }
-
-    if (![string]::IsNullOrEmpty($OTP)) {
-        $logonBody.password += ",$OTP"
-    }
+    # Authenticate and return standard Authorization header
+    $logonURL = "{0}/API/Auth/{1}/Logon" -f $BaseURL, $AuthType
+    $plainPassword = $null
 
     try {
-        Write-LogMessage -Type Verbose -Message "Authenticating to $BaseURL using $AuthType"
-        $response = Invoke-RestMethod -Uri $logonURL -Method Post -Body ($logonBody | ConvertTo-Json) -ContentType "application/json"
-        $logonBody = $null
+        $plainPassword = Convert-SecureStringToPlainText -SecureString $Credential.Password
 
-        if ([string]::IsNullOrEmpty($response)) {
+        if ([string]::IsNullOrWhiteSpace($plainPassword)) {
+            throw "Authentication failed - empty password"
+        }
+
+        if ($AuthType -eq "radius") {
+            $plainPassword = "{0},{1}" -f $plainPassword, $OTP.Trim()
+        }
+
+        # Do not log this body because it contains sensitive data
+        $logonBody = @{
+            username = $Credential.UserName
+            password = $plainPassword
+        } | ConvertTo-Json
+
+        $response = Invoke-RestMethod -Uri $logonURL -Method Post -Body $logonBody -ContentType "application/json" -ErrorAction Stop
+
+        if ([string]::IsNullOrWhiteSpace([string]$response)) {
             throw "Authentication failed - no token received"
         }
 
-        return @{ Authorization = $response }
-    }
-    catch {
+        return @{ Authorization = [string]$response }
+    } catch {
         throw "Authentication failed: $($_.Exception.Message)"
+    } finally {
+        $plainPassword = $null
     }
 }
 
-Function Invoke-PASLogoff {
+function Invoke-PASLogoff {
     param(
         [Parameter(Mandatory = $true)]
         [hashtable]$Header,
+
         [Parameter(Mandatory = $true)]
         [string]$BaseURL
     )
 
+    # Log off only when this script created the session
     try {
-        Write-LogMessage -Type Verbose -Message "Logging off session"
-        $logoffURL = "$BaseURL/api/auth/Logoff"
-        Invoke-RestMethod -Uri $logoffURL -Method Post -Headers $Header -ContentType "application/json" | Out-Null
-    }
-    catch {
-        Write-LogMessage -Type Warning -Message "Logoff failed: $($_.Exception.Message)"
+        $logoffURL = "{0}/API/Auth/Logoff" -f $BaseURL
+        Invoke-RestMethod -Uri $logoffURL -Method Post -Headers $Header -ContentType "application/json" -ErrorAction Stop | Out-Null
+    } catch {
+        Write-LogMessage -Type WARN -Message ("Logoff failed: {0}" -f $_.Exception.Message)
     }
 }
 #endregion
 
 #region Main Script
-try {
-    Write-LogMessage -Type Info -Message "Export CyberArk Applications - Starting"
+$managedSession = $false
+$sessionHeader = $null
+$exitCode = 0
 
-    # Initialize SSL/TLS
+try {
+    Write-LogMessage -Type INFO -Message "Export CyberArk Applications - Starting"
+
+    # Normalize URL once at the start
+    $PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
+
+    # Basic validation
+    if ([string]::IsNullOrWhiteSpace($PVWAUrl)) {
+        Write-LogMessage -Type ERROR -Message "PVWAUrl cannot be blank."
+        exit 1
+    }
+
+    if ([string]::IsNullOrWhiteSpace($CSVPath)) {
+        Write-LogMessage -Type ERROR -Message "CSVPath cannot be blank."
+        exit 1
+    }
+
+    if ($AuthenticationType -eq "radius" -and [string]::IsNullOrWhiteSpace($OTP)) {
+        Write-LogMessage -Type ERROR -Message "OTP is required when AuthenticationType is radius."
+        exit 1
+    }
+
+    # Initialize SSL/TLS settings
     Initialize-SSL
 
-    # Normalize PVWA URL - just trim trailing slashes
-    $PVWAUrl = $PVWAUrl.TrimEnd('/')
-
-    # Check if CSV file exists
-    if (Test-Path $CSVPath) {
+    # Check CSV target path
+    if (Test-Path -LiteralPath $CSVPath) {
         $response = Read-Host "CSV file already exists at '$CSVPath'. Overwrite? (Y/N)"
-        if ($response -notmatch '^y(es)?$') {
-            Write-LogMessage -Type Warning -Message "Export cancelled by user"
-            return
+        if ($response -notmatch '^(?i)y(es)?$') {
+            Write-LogMessage -Type WARN -Message "Export cancelled by user."
+            exit 1
         }
-        Remove-Item $CSVPath -Force
+
+        Remove-Item -LiteralPath $CSVPath -Force
     }
 
-    # Determine if we need to manage the session
-    $managedSession = $false
-    $sessionHeader = $null
-
-    if ($null -ne $logonToken) {
-        Write-LogMessage -Type Verbose -Message "Using provided session token"
-        if ($logonToken.GetType().Name -eq "String") {
-            $sessionHeader = @{ Authorization = $logonToken }
-        } else {
-            $sessionHeader = $logonToken
-        }
-    }
-    else {
-        # Need to authenticate
+    # Determine whether this script owns the session
+    if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
+        Write-LogMessage -Type INFO -Message "Using provided session token. Script will not log off."
+        $sessionHeader = @{ Authorization = $LogonToken.Trim() }
+    } else {
         $managedSession = $true
 
         if ($null -eq $Credential) {
-            $Credential = Get-Credential -Message "Enter CyberArk credentials ($AuthenticationType)"
+            $Credential = Get-Credential -Message ("Enter CyberArk credentials ({0})" -f $AuthenticationType)
         }
 
         if ($null -eq $Credential) {
-            throw "Credentials are required to proceed"
+            throw "Credentials are required to proceed."
         }
 
         $sessionHeader = Get-PASLogonHeader -Credential $Credential -BaseURL $PVWAUrl -AuthType $AuthenticationType -OTP $OTP
-        Write-LogMessage -Type Verbose -Message "Successfully authenticated"
+        Write-LogMessage -Type INFO -Message "Authentication successful."
     }
 
-    # Define API URLs
-    $applicationsURL = "$PVWAUrl/WebServices/PIMServices.svc/Applications"
+    # Gen1 applications endpoint
+    $applicationsURL = "{0}/WebServices/PIMServices.svc/Applications" -f $PVWAUrl
 
-    # Get applications
-    Write-LogMessage -Type Info -Message "Retrieving applications..."
+    # Retrieve applications
+    Write-LogMessage -Type INFO -Message "Retrieving applications..."
     $applications = @()
 
-    if (![string]::IsNullOrEmpty($AppID)) {
-        Write-LogMessage -Type Verbose -Message "Filtering by AppID: $AppID"
-        $encodedAppID = ConvertTo-URL -text $AppID
-        $response = Invoke-PASRestMethod -Method GET -URI "$applicationsURL/$encodedAppID" -Header $sessionHeader
+    if (-not [string]::IsNullOrWhiteSpace($AppID)) {
+        Write-LogMessage -Type INFO -Message ("Filtering by AppID: {0}" -f $AppID)
+
+        $encodedAppID = ConvertTo-URL -Text $AppID
+        $response = Invoke-PASRestMethod -Method GET -URI ("{0}/{1}" -f $applicationsURL, $encodedAppID) -Header $sessionHeader
+
+        # Single app response may come back in .application
         if ($null -ne $response.application) {
             $applications = @($response.application)
+        } elseif ($null -ne $response.AppID) {
+            $applications = @($response)
         }
-    }
-    else {
+    } else {
         $response = Invoke-PASRestMethod -Method GET -URI $applicationsURL -Header $sessionHeader
+
         if ($null -ne $response.application) {
             $applications = @($response.application)
         }
     }
 
     if ($applications.Count -eq 0) {
-        Write-LogMessage -Type Warning -Message "No applications found"
-        return
+        Write-LogMessage -Type WARN -Message "No applications found."
+        exit 0
     }
 
-    Write-LogMessage -Type Info -Message "Found $($applications.Count) application(s)"
+    Write-LogMessage -Type INFO -Message ("Found {0} application(s)." -f $applications.Count)
 
-    # Export applications with authentication methods
+    # Build export rows
     $exportData = @()
 
     foreach ($app in $applications) {
-        Write-LogMessage -Type Verbose -Message "Processing application: $($app.AppID)"
+        Write-LogMessage -Type INFO -Message ("Processing application: {0}" -f $app.AppID)
 
-        # Create export object with application properties
+        # Base application properties for export
         $exportObject = [PSCustomObject]@{
-            AppID                 = $app.AppID
-            Description           = $app.Description
-            Location              = $app.Location
-            AccessPermittedFrom   = $app.AccessPermittedFrom
-            AccessPermittedTo     = $app.AccessPermittedTo
-            ExpirationDate        = $app.ExpirationDate
-            Disabled              = $app.Disabled
-            BusinessOwnerFName    = $app.BusinessOwnerFName
-            BusinessOwnerLName    = $app.BusinessOwnerLName
-            BusinessOwnerEmail    = $app.BusinessOwnerEmail
-            BusinessOwnerPhone    = $app.BusinessOwnerPhone
-            Authentications       = ""
+            AppID               = $app.AppID
+            Description         = $app.Description
+            Location            = $app.Location
+            AccessPermittedFrom = $app.AccessPermittedFrom
+            AccessPermittedTo   = $app.AccessPermittedTo
+            ExpirationDate      = $app.ExpirationDate
+            Disabled            = $app.Disabled
+            BusinessOwnerFName  = $app.BusinessOwnerFName
+            BusinessOwnerLName  = $app.BusinessOwnerLName
+            BusinessOwnerEmail  = $app.BusinessOwnerEmail
+            BusinessOwnerPhone  = $app.BusinessOwnerPhone
+            Authentications     = ""
         }
 
-        # Get authentication methods for this application
+        # Retrieve auth methods for the application
         try {
-            $encodedAppID = ConvertTo-URL -text $app.AppID
-            $authURL = "$applicationsURL/$encodedAppID/Authentications"
+            $encodedAppID = ConvertTo-URL -Text $app.AppID
+            $authURL = "{0}/{1}/Authentications" -f $applicationsURL, $encodedAppID
             $authResponse = Invoke-PASRestMethod -Method GET -URI $authURL -Header $sessionHeader
 
             if ($null -ne $authResponse.authentication) {
                 $authStrings = @()
+
                 foreach ($auth in $authResponse.authentication) {
                     $authStrings += Convert-ObjectToString -Object $auth
                 }
-                $exportObject.Authentications = $authStrings -join '|'
-                Write-LogMessage -Type Verbose -Message "  Found $($authResponse.authentication.Count) authentication method(s)"
+
+                $exportObject.Authentications = $authStrings -join "|"
+                Write-LogMessage -Type INFO -Message ("Found {0} authentication method(s) for {1}." -f $authResponse.authentication.Count, $app.AppID)
+            } else {
+                Write-LogMessage -Type INFO -Message ("No authentication methods found for {0}." -f $app.AppID)
             }
-        }
-        catch {
-            Write-LogMessage -Type Warning -Message "  Failed to retrieve authentication methods: $($_.Exception.Message)"
+        } catch {
+            Write-LogMessage -Type WARN -Message ("Failed to retrieve authentication methods for {0}: {1}" -f $app.AppID, $_.Exception.Message)
         }
 
         $exportData += $exportObject
     }
 
-    # Export to CSV
-    Write-LogMessage -Type Info -Message "Exporting to CSV: $CSVPath"
-    $exportData | Export-Csv -Path $CSVPath -NoTypeInformation -Encoding UTF8
-    Write-LogMessage -Type Info -Message "Successfully exported $($exportData.Count) application(s)"
+    # Ensure target directory exists if specified
+    $csvParent = Split-Path -Path $CSVPath -Parent
+    if (-not [string]::IsNullOrWhiteSpace($csvParent) -and -not (Test-Path -LiteralPath $csvParent)) {
+        New-Item -Path $csvParent -ItemType Directory -Force | Out-Null
+    }
 
+    # Export to CSV
+    Write-LogMessage -Type INFO -Message ("Exporting to CSV: {0}" -f $CSVPath)
+    $exportData | Export-Csv -Path $CSVPath -NoTypeInformation -Encoding UTF8
+
+    Write-LogMessage -Type INFO -Message ("Successfully exported {0} application(s)." -f $exportData.Count)
 }
 catch {
-    Write-LogMessage -Type Error -Message "Export failed: $($_.Exception.Message)"
-    throw
+    $exitCode = 1
+    Write-LogMessage -Type ERROR -Message ("Export failed: {0}" -f $_.Exception.Message)
 }
 finally {
-    # Cleanup
+    # Log off only when this script created the session
     if ($managedSession -and $null -ne $sessionHeader) {
         Invoke-PASLogoff -Header $sessionHeader -BaseURL $PVWAUrl
-        Write-LogMessage -Type Verbose -Message "Session logged off"
-    }
-    elseif ($null -ne $logonToken) {
-        Write-LogMessage -Type Verbose -Message "Session token was provided - NOT logging off (session management is caller's responsibility)"
-    }
-
-    # Clear sensitive data
-    if ($null -ne $Credential) {
-        $Credential = $null
+        Write-LogMessage -Type INFO -Message "Session closed."
+    } elseif (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
+        Write-LogMessage -Type INFO -Message "Session token was provided. Not logging off."
     }
 
-    Write-LogMessage -Type Info -Message "Export CyberArk Applications - Complete"
+    # Clear sensitive references
+    $Credential = $null
+    $sessionHeader = $null
+
+    Write-LogMessage -Type INFO -Message "Export CyberArk Applications - Complete"
+    exit $exitCode
 }
 #endregion
