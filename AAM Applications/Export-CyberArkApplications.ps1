@@ -146,23 +146,30 @@ function Convert-ObjectToString {
         $arrItems = @()
 
         $Object.PSObject.Properties | ForEach-Object {
-            # Skip IDs and blank values
-            if ($_.Name -notin @("authID", "authenticationID", "AppID") -and $null -ne $_.Value -and -not [string]::IsNullOrWhiteSpace([string]$_.Value)) {
-                $value = $_.Value
+            if ($_.Name -in @('authID', 'authenticationID', 'AppID')) {
+                return
+            }
 
-                if ($value -is [array]) {
-                    # Trim array elements and join without spaces
-                    $value = ($value | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -ne "" }) -join ","
-                } else {
-                    # Trim and remove spaces after commas for consistency
-                    $value = ([string]$value).Trim() -replace ",\s+", ","
-                }
+            if ($null -eq $_.Value) {
+                return
+            }
 
+            $value = $_.Value
+
+            if ($value -is [array]) {
+                # Trim array elements and join without spaces
+                $value = ($value | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -ne '' }) -join ','
+            } else {
+                # Trim and remove spaces after commas for consistency
+                $value = ([string]$value).Trim() -replace ',\s+', ','
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
                 $arrItems += ("{0}={1}" -f $_.Name, $value)
             }
         }
 
-        $retString = $arrItems -join ";"
+        $retString = $arrItems -join ';'
     }
 
     return $retString
