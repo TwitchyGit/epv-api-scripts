@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Deletes an authentication method from a CyberArk Application.
 
@@ -7,7 +7,7 @@
     method from a specified application using the AuthID.
 
 .PARAMETER PVWAUrl
-    The base URL of the CyberArk PVWA (e.g., https://pvwa.company.com)
+    The base URL of the CyberArk PVWA (e.g. https://pvwa.company.com)
 
 .PARAMETER Credential
     PSCredential object for CyberArk authentication. If not provided, will prompt.
@@ -58,207 +58,364 @@ param(
     [Parameter(Mandatory = $false)]
     [PSCredential]$Credential,
 
-    [Parameter(Mandatory = $false, HelpMessage = 'Enter the Authentication type (Default:CyberArk)')]
+    [Parameter(Mandatory = $false, HelpMessage = 'Enter the Authentication type (Default: cyberark)')]
     [ValidateSet('cyberark', 'ldap', 'radius')]
-    [String]$AuthenticationType = 'cyberark',
+    [string]$AuthenticationType = 'cyberark',
 
     [Parameter(Mandatory = $false, HelpMessage = 'Enter the RADIUS OTP')]
-    [String]$OTP,
+    [string]$OTP,
 
     [Parameter(Mandatory = $false, HelpMessage = 'Use this parameter to pass a pre-existing authorization token. If passed the token is NOT logged off')]
     [Alias('session', 'sessionToken')]
-    $logonToken
+    [string]$LogonToken
 )
 
-# Disable certificate validation if requested (NOT recommended for production)
-if ($DisableCertificateValidation) {
-    Write-Warning "Certificate validation is disabled. This should only be used for testing!"
-    add-type @"
-        using System.Net;
-        using System.Security.Cryptography.X509Certificates;
-        public class TrustAllCertsPolicy : ICertificatePolicy {
-            public bool CheckValidationResult(
-                ServicePoint srvPoint, X509Certificate certificate,
-                WebRequest request, int certificateProblem) {
-                return true;
-            }
+function Write-Log {
+    param(
+        [string]$Level,
+        [string]$Message
+    )
+
+    # Simple operator friendly logging
+    Write-Output ("{0} {1}" -f $Level.ToUpper().PadRight(5), $Message)
+}
+
+function Convert-SecureStringToPlainText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.SecureString]$SecureString
+    )
+
+    # Convert SecureString for API logon payload
+    # BSTR is zeroed immediately after use
+    $bstr = $null
+    $plainText = $null
+
+    try {
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+        $plainText = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    } finally {
+        if ($bstr) {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
         }
+    }
+
+    return $plainText
+}
+
+function ConvertTo-URL {
+    param(
+        [string]$Text
+    )
+
+    # Encode values for safe inclusion in URLs
+    if (-not [string]::IsNullOrWhiteSpace($Text)) {
+        return [URI]::EscapeDataString($Text)
+    }
+
+    return $Text
+}
+
+function Invoke-CyberArkRest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('GET', 'POST', 'DELETE')]
+        [string]$Method,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Headers,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Body
+    )
+
+    # Wrapper for consistent REST behaviour and error handling
+    if ([string]::IsNullOrWhiteSpace($Body)) {
+        return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -ContentType 'application/json' -ErrorAction Stop
+    } else {
+        return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $Body -ContentType 'application/json' -ErrorAction Stop
+    }
+}
+
+# -------------------------------------------------------------------
+# Initial state
+# -------------------------------------------------------------------
+$exitCode = 0
+$sessionToken = $null
+$shouldLogoff = $true
+$plainPassword = $null
+$headers = @{}
+
+# Normalize URL once at the start
+$PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
+
+# -------------------------------------------------------------------
+# Basic validation
+# -------------------------------------------------------------------
+if ([string]::IsNullOrWhiteSpace($AppID)) {
+    Write-Log 'ERROR' 'AppID cannot be blank.'
+    exit 1
+}
+
+if ([string]::IsNullOrWhiteSpace($PVWAUrl)) {
+    Write-Log 'ERROR' 'PVWAUrl cannot be blank.'
+    exit 1
+}
+
+if ($AuthID -lt 1) {
+    Write-Log 'ERROR' 'AuthID must be greater than 0.'
+    exit 1
+}
+
+# RADIUS requires OTP
+if ($AuthenticationType -eq 'radius' -and [string]::IsNullOrWhiteSpace($OTP)) {
+    Write-Log 'ERROR' 'OTP is required when AuthenticationType is radius.'
+    exit 1
+}
+
+# -------------------------------------------------------------------
+# Optional certificate validation bypass
+# -------------------------------------------------------------------
+if ($DisableCertificateValidation) {
+    Write-Log 'WARN' 'Certificate validation is disabled. Use only for testing.'
+
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint,
+        X509Certificate certificate,
+        WebRequest request,
+        int certificateProblem) {
+        return true;
+    }
+}
 "@
+    }
+
     [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 }
 
-# Set TLS to 1.2 or higher
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# Ensure TLS 1.2 is enabled without wiping other flags
+if (([Net.ServicePointManager]::SecurityProtocol -band [Net.SecurityProtocolType]::Tls12) -eq 0) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
 
-# Check if session token was provided
-$shouldLogoff = $true
-if ($logonToken) {
-    Write-Output 'Using provided session token...'
-    if ($logonToken.GetType().name -eq 'String') {
-        $sessionToken = $logonToken
-    } else {
-        $sessionToken = $logonToken
-    }
+# -------------------------------------------------------------------
+# Authentication / session handling
+# -------------------------------------------------------------------
+if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
+    # Reuse caller provided token
+    $sessionToken = $LogonToken.Trim()
     $shouldLogoff = $false
-    Write-Output 'Session token accepted. Will NOT log off at end.'
+    Write-Log 'INFO' 'Using provided session token. Script will not log off.'
 } else {
-    # Prompt for credentials if not provided
+    # Prompt if credential not supplied
     if (-not $Credential) {
         $Credential = Get-Credential -Message 'Enter CyberArk credentials'
-        if (-not $Credential) {
-            throw 'Credentials are required to proceed.'
-        }
     }
 
-    # Extract username and password from credential object
-    $Username = $Credential.UserName
-    $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
-    $PlainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+    if (-not $Credential) {
+        Write-Log 'ERROR' 'Credentials are required to proceed.'
+        exit 1
+    }
 
-    Write-Output "Authenticating to CyberArk using $AuthenticationType..."
+    $userName = $Credential.UserName
+    $plainPassword = Convert-SecureStringToPlainText -SecureString $Credential.Password
 
-    # Prepare authentication request
-    $authUrl = "$PVWAUrl/API/Auth/$AuthenticationType/Logon"
+    if ([string]::IsNullOrWhiteSpace($plainPassword)) {
+        Write-Log 'ERROR' 'Password could not be extracted from credential object.'
+        exit 1
+    }
+
+    Write-Log 'INFO' ("Authenticating to CyberArk using {0}..." -f $AuthenticationType)
+
+    # Build password string for logon
+    # RADIUS uses password,OTP format
+    $passwordToSend = $plainPassword
+    if ($AuthenticationType -eq 'radius') {
+        $passwordToSend = '{0},{1}' -f $plainPassword, $OTP.Trim()
+    }
+
+    # Build logon body
+    # Do not log this body because it contains sensitive data
     $authBody = @{
-        username          = $Username
-        password          = $PlainPassword
+        username          = $userName
+        password          = $passwordToSend
         concurrentSession = $true
     } | ConvertTo-Json
 
-    # Add RADIUS OTP if provided
-    if ($AuthenticationType -eq 'radius' -and $OTP) {
-        $authBodyObj = $authBody | ConvertFrom-Json
-        $authBodyObj.password = "$PlainPassword,$OTP"
-        $authBody = $authBodyObj | ConvertTo-Json
-    }
+    $authUrl = "{0}/API/Auth/{1}/Logon" -f $PVWAUrl, $AuthenticationType
 
-    Write-Verbose $authBody
+    try {
+        $authResponse = Invoke-CyberArkRest -Method POST -Uri $authUrl -Body $authBody
+        $sessionToken = [string]$authResponse
+        Write-Log 'INFO' 'Authentication successful.'
+    } catch {
+        Write-Log 'ERROR' ("Authentication failed: {0}" -f $_.Exception.Message)
+        if ($_.ErrorDetails.Message) {
+            Write-Log 'ERROR' ("API Error Details: {0}" -f $_.ErrorDetails.Message)
+        }
+        exit 1
+    }
 }
 
+# Headers used for subsequent API calls
+$headers = @{
+    Authorization = $sessionToken
+    'Content-Type' = 'application/json'
+}
+
+# Encode AppID for URL safety
+$appIdEncoded = ConvertTo-URL -Text $AppID
+
+# Gen1 application endpoints
+$getAuthUrl = "{0}/WebServices/PIMServices.svc/Applications/{1}/Authentications/" -f $PVWAUrl, $appIdEncoded
+$deleteAuthUrl = "{0}/WebServices/PIMServices.svc/Applications/{1}/Authentications/{2}/" -f $PVWAUrl, $appIdEncoded, $AuthID
+
 try {
-    if (-not $logonToken) {
-        # Authenticate and get session token
-        $authResponse = Invoke-RestMethod -Uri $authUrl -Method Post -Body $authBody -ContentType 'application/json'
-        Write-Verbose $authResponse
-        $sessionToken = $authResponse
+    # -------------------------------------------------------------------
+    # Retrieve authentication methods
+    # -------------------------------------------------------------------
+    Write-Log 'INFO' ("Retrieving authentication methods for application '{0}'..." -f $AppID)
+    $authMethods = Invoke-CyberArkRest -Method GET -Uri $getAuthUrl -Headers $headers
 
-        Write-Output 'Authentication successful!'
+    if (-not $authMethods.authentication) {
+        throw "No authentication methods were found for application '$AppID'."
     }
 
-    # Prepare the API URL (remove any trailing slash from PVWAUrl)
-    $PVWAUrl = $PVWAUrl.TrimEnd('/')
-    $deleteAuthUrl = "$PVWAUrl/WebServices/PIMServices.svc/Applications/$AppID/Authentications/$AuthID/"
-    Write-Verbose "DELETE URL: $deleteAuthUrl"
+    # Find requested authentication by AuthID
+    $authToDelete = @($authMethods.authentication | Where-Object { $_.authID -eq $AuthID })
 
-    # Prepare headers with session token
-    $headers = @{
-        'Authorization' = $sessionToken
-        'Content-Type'  = 'application/json'
-    }
-
-    # Get authentication details before deleting (for display purposes)
-    Write-Output "`nRetrieving authentication details before deletion..."
-    $getAuthUrl = "$PVWAUrl/WebServices/PIMServices.svc/Applications/$AppID/Authentications/"
-    $authMethods = Invoke-RestMethod -Uri $getAuthUrl -Method Get -Headers $headers
-    $authToDelete = $authMethods.authentication | Where-Object { $_.authID -eq $AuthID }
-
-    if (-not $authToDelete) {
+    if ($authToDelete.Count -eq 0) {
         throw "Authentication with AuthID $AuthID not found for application '$AppID'."
     }
 
-    Write-Output "`nAuthentication to be deleted:"
-    Write-Output "  - Auth ID: $($authToDelete.authID) | Type: $($authToDelete.AuthType)"
+    if ($authToDelete.Count -gt 1) {
+        throw "Multiple authentication records were returned for AuthID $AuthID on application '$AppID'."
+    }
+
+    $authToDelete = $authToDelete[0]
+
+    # -------------------------------------------------------------------
+    # Display authentication selected for deletion
+    # -------------------------------------------------------------------
+    Write-Output ''
+    Write-Output 'Authentication to be deleted:'
+    Write-Output ("  - Auth ID: {0} | Type: {1}" -f $authToDelete.authID, $authToDelete.AuthType)
+
     if ($authToDelete.AuthValue) {
-        Write-Output "    AuthValue: $($authToDelete.AuthValue)"
+        Write-Output ("    AuthValue: {0}" -f $authToDelete.AuthValue)
     }
+
     if ($authToDelete.Subject) {
-        Write-Output "    Subject: $($authToDelete.Subject -join ', ')"
+        Write-Output ("    Subject: {0}" -f (@($authToDelete.Subject) -join ', '))
     }
+
     if ($authToDelete.Issuer) {
-        Write-Output "    Issuer: $($authToDelete.Issuer -join ', ')"
+        Write-Output ("    Issuer: {0}" -f (@($authToDelete.Issuer) -join ', '))
     }
+
     if ($authToDelete.SubjectAlternativeName) {
-        Write-Output "    SubjectAlternativeName: $($authToDelete.SubjectAlternativeName -join ', ')"
+        Write-Output ("    SubjectAlternativeName: {0}" -f (@($authToDelete.SubjectAlternativeName) -join ', '))
     }
 
+    if ($authToDelete.Comment) {
+        Write-Output ("    Comment: {0}" -f $authToDelete.Comment)
+    }
+
+    if ($null -ne $authToDelete.IsFolder) {
+        Write-Output ("    IsFolder: {0}" -f $authToDelete.IsFolder)
+    }
+
+    if ($null -ne $authToDelete.AllowInternalScripts) {
+        Write-Output ("    AllowInternalScripts: {0}" -f $authToDelete.AllowInternalScripts)
+    }
+
+    # -------------------------------------------------------------------
     # Confirm deletion
-    $confirmation = Read-Host "`nAre you sure you want to delete this authentication? (yes/no)"
+    # -------------------------------------------------------------------
+    $confirmation = Read-Host "Are you sure you want to delete this authentication? Type yes to continue"
     if ($confirmation -ne 'yes') {
-        Write-Output "Deletion cancelled by user."
-        return
+        Write-Log 'WARN' 'Deletion cancelled by user.'
+        exit 1
     }
 
+    # -------------------------------------------------------------------
     # Delete authentication method
-    Write-Output "`nDeleting authentication (AuthID: $AuthID) from application '$AppID'..."
-    Invoke-RestMethod -Uri $deleteAuthUrl -Method Delete -Headers $headers
+    # -------------------------------------------------------------------
+    Write-Log 'INFO' ("Deleting authentication AuthID {0} from application '{1}'..." -f $AuthID, $AppID)
+    $null = Invoke-CyberArkRest -Method DELETE -Uri $deleteAuthUrl -Headers $headers
+    Write-Log 'INFO' ("Authentication AuthID {0} was deleted from application '{1}'." -f $AuthID, $AppID)
 
-    Write-Output "`nAuthentication successfully deleted from application '$AppID'!"
+    # -------------------------------------------------------------------
+    # Verify deletion
+    # -------------------------------------------------------------------
+    Write-Log 'INFO' 'Verifying authentication was deleted...'
+    $authMethodsAfterDelete = Invoke-CyberArkRest -Method GET -Uri $getAuthUrl -Headers $headers
+    $stillExists = @($authMethodsAfterDelete.authentication | Where-Object { $_.authID -eq $AuthID })
 
-    # Verify the authentication was deleted
-    Write-Output "`nVerifying authentication was deleted..."
-    $authMethods = Invoke-RestMethod -Uri $getAuthUrl -Method Get -Headers $headers
-    $stillExists = $authMethods.authentication | Where-Object { $_.authID -eq $AuthID }
-
-    if (-not $stillExists) {
-        Write-Output "Confirmed: Authentication (AuthID: $AuthID) no longer exists."
+    if ($stillExists.Count -eq 0) {
+        Write-Log 'INFO' ("Confirmed: Authentication AuthID {0} no longer exists." -f $AuthID)
     } else {
-        Write-Output "Warning: Authentication (AuthID: $AuthID) still appears to exist."
+        Write-Log 'WARN' ("Authentication AuthID {0} still appears to exist." -f $AuthID)
+        $exitCode = 1
     }
 
+    # -------------------------------------------------------------------
     # Display remaining authentication methods
-    if ($authMethods.authentication) {
-        Write-Output "`nRemaining authentication method(s) for application '$AppID': $($authMethods.authentication.Count)"
-        Write-Output ("=" * 80)
-        foreach ($auth in $authMethods.authentication) {
-            Write-Output "  - Auth ID: $($auth.authID) | Type: $($auth.AuthType)"
+    # -------------------------------------------------------------------
+    if ($authMethodsAfterDelete.authentication) {
+        Write-Output ''
+        Write-Output ("Remaining authentication method(s) for application '{0}': {1}" -f $AppID, $authMethodsAfterDelete.authentication.Count)
+        Write-Output ('=' * 80)
+
+        foreach ($auth in $authMethodsAfterDelete.authentication) {
+            Write-Output ("  - Auth ID: {0} | Type: {1}" -f $auth.authID, $auth.AuthType)
+
             if ($auth.AuthValue) {
-                Write-Output "    AuthValue: $($auth.AuthValue)"
+                Write-Output ("    AuthValue: {0}" -f $auth.AuthValue)
             }
         }
-        Write-Output ("=" * 80)
-    } else {
-        Write-Output "`nNo authentication methods remain for application '$AppID'."
-    }
 
-    # Logoff (only if we authenticated in this script)
-    if ($shouldLogoff) {
-        Write-Output "`nLogging off..."
-        $logoffUrl = "$PVWAUrl/API/Auth/Logoff"
-        Invoke-RestMethod -Uri $logoffUrl -Method Post -Headers $headers
-        Write-Output 'Session closed successfully.'
+        Write-Output ('=' * 80)
     } else {
-        Write-Output "`nSession token was provided - NOT logging off."
+        Write-Output ''
+        Write-Log 'INFO' ("No authentication methods remain for application '{0}'." -f $AppID)
     }
 } catch {
-    Write-Output "`nError occurred:"
-    Write-Output $_.Exception.Message
+    $exitCode = 1
+    Write-Output ''
+    Write-Log 'ERROR' ("Error occurred: {0}" -f $_.Exception.Message)
 
     if ($_.ErrorDetails.Message) {
-        Write-Output 'API Error Details:'
-        Write-Output $_.ErrorDetails.Message
+        Write-Log 'ERROR' ("API Error Details: {0}" -f $_.ErrorDetails.Message)
     }
-
-    # Attempt to log off even if there was an error (only if we authenticated)
-    if ($sessionToken -and $shouldLogoff) {
-        try {
-            $logoffUrl = "$PVWAUrl/API/Auth/Logoff"
-            $headers = @{
-                'Authorization' = $sessionToken
-            }
-            Invoke-RestMethod -Uri $logoffUrl -Method Post -Headers $headers
-            Write-Output 'Session closed.'
-        } catch {
-            Write-Output 'Could not close session properly.'
-        }
-    } elseif (-not $shouldLogoff) {
-        Write-Output 'Session token was provided - NOT logging off.'
-    }
-
-    exit 1
 } finally {
-    # Clear sensitive data from memory
-    if ($BSTR) {
-        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
+    # -------------------------------------------------------------------
+    # Log off if we created the session
+    # -------------------------------------------------------------------
+    if ($shouldLogoff -and -not [string]::IsNullOrWhiteSpace($sessionToken)) {
+        try {
+            Write-Log 'INFO' 'Logging off...'
+            $logoffUrl = "{0}/API/Auth/Logoff" -f $PVWAUrl
+            $null = Invoke-CyberArkRest -Method POST -Uri $logoffUrl -Headers @{ Authorization = $sessionToken }
+            Write-Log 'INFO' 'Session closed successfully.'
+        } catch {
+            Write-Log 'WARN' ("Could not close session properly: {0}" -f $_.Exception.Message)
+        }
+    } else {
+        Write-Log 'INFO' 'Session token was provided. Not logging off.'
     }
-    $PlainPassword = $null
+
+    # Clear sensitive variable references
+    $plainPassword = $null
+    $Credential = $null
+
+    exit $exitCode
 }
