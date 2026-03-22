@@ -146,6 +146,8 @@ $exitCode = 0
 $shouldLogoff = $true
 $parsedExpirationDate = $null
 $targetLocation = '\'
+$existingApp = $null
+$verifiedApp = $null
 
 # Normalize string inputs once at the start
 $PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
@@ -194,151 +196,166 @@ if (-not (Get-Module -ListAvailable -Name psPAS)) {
 # Import psPAS into the current session
 Import-Module psPAS -ErrorAction Stop
 
-try {
-    # Reuse an existing psPAS session if supplied
-    if ($null -ne $LogonToken) {
+# Reuse an existing psPAS session if supplied
+if ($null -ne $LogonToken) {
+    try {
         Use-PASSession -Session $LogonToken
         $shouldLogoff = $false
         Write-Log 'INFO' 'Using provided psPAS session. Script will not log off.'
-    } else {
-        # Prompt for credentials if not provided
-        if (-not $Credential) {
-            $Credential = Get-Credential -Message 'Enter CyberArk credentials'
-        }
+    } catch {
+        Write-Log 'ERROR' ("Could not use provided psPAS session: {0}" -f $_.Exception.Message)
+        exit 1
+    }
+} else {
+    # Prompt for credentials if not provided
+    if (-not $Credential) {
+        $Credential = Get-Credential -Message 'Enter CyberArk credentials'
+    }
 
-        if (-not $Credential) {
-            Write-Log 'ERROR' 'Credentials are required to proceed.'
-            exit 1
-        }
+    if (-not $Credential) {
+        Write-Log 'ERROR' 'Credentials are required to proceed.'
+        exit 1
+    }
 
-        Write-Log 'INFO' ("Authenticating with psPAS using {0}..." -f $AuthenticationType)
+    Write-Log 'INFO' ("Authenticating with psPAS using {0}..." -f $AuthenticationType)
 
-        # Build New-PASSession parameters
-        $sessionParams = @{
-            BaseURI          = $PVWAUrl
-            Credential       = $Credential
-            Type             = $AuthenticationType
-            SkipVersionCheck = $true
-        }
+    # Build New-PASSession parameters
+    $sessionParams = @{
+        BaseURI          = $PVWAUrl
+        Credential       = $Credential
+        Type             = $AuthenticationType
+        SkipVersionCheck = $true
+    }
 
-        # Optional certificate validation bypass
-        if ($DisableCertificateValidation) {
-            $sessionParams['SkipCertificateCheck'] = $true
-        }
+    # Optional certificate validation bypass
+    if ($DisableCertificateValidation) {
+        $sessionParams['SkipCertificateCheck'] = $true
+    }
 
-        # Add OTP only for RADIUS
-        if ($AuthenticationType -eq 'radius') {
-            $sessionParams['OTP'] = $OTP
-        }
+    # Add OTP only for RADIUS
+    if ($AuthenticationType -eq 'radius') {
+        $sessionParams['OTP'] = $OTP
+    }
 
-        # Create a new psPAS session
+    # Create a new psPAS session
+    try {
         $null = New-PASSession @sessionParams
         Write-Log 'INFO' 'Authentication successful.'
-    }
-
-    # Check whether application already exists
-    Write-Log 'INFO' ("Checking if application '{0}' already exists..." -f $AppID)
-
-    $existingApp = $null
-    try {
-        $existingApp = Get-PASApplication $AppID -ExactMatch
     } catch {
-        $existingApp = $null
+        Write-Log 'ERROR' ("Authentication failed: {0}" -f $_.Exception.Message)
+        exit 1
+    }
+}
+
+# Check whether application already exists
+Write-Log 'INFO' ("Checking if application '{0}' already exists..." -f $AppID)
+
+try {
+    $existingApp = Get-PASApplication -AppID $AppID -ExactMatch
+} catch {
+    $existingApp = $null
+}
+
+if ($existingApp) {
+    Write-Log 'ERROR' ("Application '{0}' already exists. Use a different name or delete the existing application first." -f $AppID)
+    $exitCode = 1
+}
+
+# Prepare and create the application
+if ($exitCode -eq 0) {
+    $addParams = @{
+        AppID    = $AppID
+        Location = $targetLocation
+        Disabled = $Disabled
     }
 
-    if ($existingApp) {
-        Write-Log 'ERROR' ("Application '{0}' already exists. Use a different name or delete the existing application first." -f $AppID)
-        $exitCode = 1
-    }
+    # Add optional properties only when supplied
+    if (-not [string]::IsNullOrWhiteSpace($Description)) { $addParams['Description'] = $Description.Trim() }
+    if ($PSBoundParameters.ContainsKey('AccessPermittedFrom')) { $addParams['AccessPermittedFrom'] = $AccessPermittedFrom }
+    if ($PSBoundParameters.ContainsKey('AccessPermittedTo')) { $addParams['AccessPermittedTo'] = $AccessPermittedTo }
+    if ($null -ne $parsedExpirationDate) { $addParams['ExpirationDate'] = $parsedExpirationDate }
+    if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerFName)) { $addParams['BusinessOwnerFName'] = $BusinessOwnerFName.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerLName)) { $addParams['BusinessOwnerLName'] = $BusinessOwnerLName.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerEmail)) { $addParams['BusinessOwnerEmail'] = $BusinessOwnerEmail.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerPhone)) { $addParams['BusinessOwnerPhone'] = $BusinessOwnerPhone.Trim() }
 
-    # Prepare and create the application
-    if ($exitCode -eq 0) {
-        $addParams = @{
-            AppID    = $AppID
-            Location = $targetLocation
-            Disabled = $Disabled
-        }
+    Write-Log 'INFO' ("Creating application '{0}'..." -f $AppID)
 
-        # Add optional properties only when supplied
-        if (-not [string]::IsNullOrWhiteSpace($Description)) { $addParams['Description'] = $Description.Trim() }
-        if ($PSBoundParameters.ContainsKey('AccessPermittedFrom')) { $addParams['AccessPermittedFrom'] = $AccessPermittedFrom }
-        if ($PSBoundParameters.ContainsKey('AccessPermittedTo')) { $addParams['AccessPermittedTo'] = $AccessPermittedTo }
-        if ($null -ne $parsedExpirationDate) { $addParams['ExpirationDate'] = $parsedExpirationDate }
-        if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerFName)) { $addParams['BusinessOwnerFName'] = $BusinessOwnerFName.Trim() }
-        if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerLName)) { $addParams['BusinessOwnerLName'] = $BusinessOwnerLName.Trim() }
-        if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerEmail)) { $addParams['BusinessOwnerEmail'] = $BusinessOwnerEmail.Trim() }
-        if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerPhone)) { $addParams['BusinessOwnerPhone'] = $BusinessOwnerPhone.Trim() }
-
-        Write-Log 'INFO' ("Creating application '{0}'..." -f $AppID)
+    try {
         $null = Add-PASApplication @addParams
         Write-Log 'INFO' ("Application '{0}' created successfully." -f $AppID)
-
-        # Verify the application was created
-        Write-Log 'INFO' 'Verifying application was created...'
-        $verifiedApp = Get-PASApplication $AppID -ExactMatch
-
-        # Display the application details
-        if ($null -ne $verifiedApp) {
-            Write-Output ''
-            Write-Output 'Application Details:'
-            Write-Output ('=' * 80)
-            Write-Output ("  AppID: {0}" -f $verifiedApp.AppID)
-
-            if ($verifiedApp.Description) {
-                Write-Output ("  Description: {0}" -f $verifiedApp.Description)
-            }
-
-            if ($verifiedApp.Location) {
-                Write-Output ("  Location: {0}" -f $verifiedApp.Location)
-            }
-
-            Write-Output ("  Disabled: {0}" -f $verifiedApp.Disabled)
-
-            if ($null -ne $verifiedApp.AccessPermittedFrom -or $null -ne $verifiedApp.AccessPermittedTo) {
-                Write-Output ("  Access Hours: {0} - {1}" -f $verifiedApp.AccessPermittedFrom, $verifiedApp.AccessPermittedTo)
-            }
-
-            if ($verifiedApp.ExpirationDate) {
-                Write-Output ("  Expiration Date: {0}" -f $verifiedApp.ExpirationDate)
-            }
-
-            if ($verifiedApp.BusinessOwnerFName -or $verifiedApp.BusinessOwnerLName) {
-                Write-Output ("  Business Owner: {0} {1}" -f $verifiedApp.BusinessOwnerFName, $verifiedApp.BusinessOwnerLName)
-            }
-
-            if ($verifiedApp.BusinessOwnerEmail) {
-                Write-Output ("  Business Owner Email: {0}" -f $verifiedApp.BusinessOwnerEmail)
-            }
-
-            if ($verifiedApp.BusinessOwnerPhone) {
-                Write-Output ("  Business Owner Phone: {0}" -f $verifiedApp.BusinessOwnerPhone)
-            }
-
-            Write-Output ('=' * 80)
-        } else {
-            Write-Log 'WARN' ("Application '{0}' was created but could not be re-read for display." -f $AppID)
-        }
+    } catch {
+        Write-Log 'ERROR' ("Could not create application '{0}': {1}" -f $AppID, $_.Exception.Message)
+        $exitCode = 1
     }
-} catch {
-    $exitCode = 1
-    Write-Output ''
-    Write-Log 'ERROR' ("Error occurred: {0}" -f $_.Exception.Message)
-} finally {
-    # Log off only if this script created the session
-    if ($shouldLogoff) {
-        try {
-            Write-Log 'INFO' 'Logging off...'
-            Close-PASSession
-            Write-Log 'INFO' 'Session closed successfully.'
-        } catch {
-            Write-Log 'WARN' ("Could not close session properly: {0}" -f $_.Exception.Message)
-        }
-    } else {
-        Write-Log 'INFO' 'psPAS session was provided. Not logging off.'
-    }
-
-    # Clear sensitive references
-    $Credential = $null
-
-    exit $exitCode
 }
+
+# Verify the application was created
+if ($exitCode -eq 0) {
+    Write-Log 'INFO' 'Verifying application was created...'
+
+    try {
+        $verifiedApp = Get-PASApplication -AppID $AppID -ExactMatch
+    } catch {
+        $verifiedApp = $null
+        Write-Log 'WARN' ("Application '{0}' was created but could not be re-read for display: {1}" -f $AppID, $_.Exception.Message)
+    }
+
+    # Display the application details
+    if ($null -ne $verifiedApp) {
+        Write-Output ''
+        Write-Output 'Application Details:'
+        Write-Output ('=' * 80)
+        Write-Output ("  AppID: {0}" -f $verifiedApp.AppID)
+
+        if ($verifiedApp.Description) {
+            Write-Output ("  Description: {0}" -f $verifiedApp.Description)
+        }
+
+        if ($verifiedApp.Location) {
+            Write-Output ("  Location: {0}" -f $verifiedApp.Location)
+        }
+
+        Write-Output ("  Disabled: {0}" -f $verifiedApp.Disabled)
+
+        if ($null -ne $verifiedApp.AccessPermittedFrom -or $null -ne $verifiedApp.AccessPermittedTo) {
+            Write-Output ("  Access Hours: {0} - {1}" -f $verifiedApp.AccessPermittedFrom, $verifiedApp.AccessPermittedTo)
+        }
+
+        if ($verifiedApp.ExpirationDate) {
+            Write-Output ("  Expiration Date: {0}" -f $verifiedApp.ExpirationDate)
+        }
+
+        if ($verifiedApp.BusinessOwnerFName -or $verifiedApp.BusinessOwnerLName) {
+            Write-Output ("  Business Owner: {0} {1}" -f $verifiedApp.BusinessOwnerFName, $verifiedApp.BusinessOwnerLName)
+        }
+
+        if ($verifiedApp.BusinessOwnerEmail) {
+            Write-Output ("  Business Owner Email: {0}" -f $verifiedApp.BusinessOwnerEmail)
+        }
+
+        if ($verifiedApp.BusinessOwnerPhone) {
+            Write-Output ("  Business Owner Phone: {0}" -f $verifiedApp.BusinessOwnerPhone)
+        }
+
+        Write-Output ('=' * 80)
+    }
+}
+
+# Log off only if this script created the session
+if ($shouldLogoff) {
+    try {
+        Write-Log 'INFO' 'Logging off...'
+        Close-PASSession
+        Write-Log 'INFO' 'Session closed successfully.'
+    } catch {
+        Write-Log 'WARN' ("Could not close session properly: {0}" -f $_.Exception.Message)
+    }
+} else {
+    Write-Log 'INFO' 'psPAS session was provided. Not logging off.'
+}
+
+# Clear sensitive references
+$Credential = $null
+
+exit $exitCode
