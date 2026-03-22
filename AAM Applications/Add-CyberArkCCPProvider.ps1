@@ -10,6 +10,7 @@
     - In location \Applications
     - With user type AppProvider
     - With vault authorization AuditUsers
+    - With password set to never expire
 
 .PARAMETER ServerName
     The server name used to build the CCP provider user name.
@@ -98,8 +99,9 @@ $exitCode = 0
 $shouldLogoff = $true
 $userName = $null
 $existingUser = $null
-$newUser = $null
+$createdUser = $null
 $verifiedUser = $null
+$userId = $null
 
 # Normalize string inputs once at the start
 $PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
@@ -208,20 +210,19 @@ if ($existingUser) {
     $exitCode = 1
 }
 
-# Prepare and create the CCP provider user
+# Create the CCP provider user
 if ($exitCode -eq 0) {
     $newUserParams = @{
-        UserName           = $userName
-        InitialPassword    = $InitialPassword
-        userType           = 'AppProvider'
-        Location           = '\Applications'
-        vaultAuthorization = @('AuditUsers')
+        UserName        = $userName
+        InitialPassword = $InitialPassword
+        UserTypeName    = 'AppProvider'
+        Location        = '\Applications'
     }
 
     Write-Log 'INFO' ("Creating CCP provider user '{0}'..." -f $userName)
 
     try {
-        $newUser = New-PASUser @newUserParams
+        $createdUser = New-PASUser @newUserParams
         Write-Log 'INFO' ("User '{0}' created successfully." -f $userName)
     } catch {
         Write-Log 'ERROR' ("Could not create user '{0}': {1}" -f $userName, $_.Exception.Message)
@@ -229,15 +230,54 @@ if ($exitCode -eq 0) {
     }
 }
 
-# Verify the user was created
+# Re-read the user so we have its ID
 if ($exitCode -eq 0) {
-    Write-Log 'INFO' 'Verifying user was created...'
+    Write-Log 'INFO' 'Retrieving created user details...'
 
     try {
         $verifiedUser = Get-PASUser -UserName $userName
     } catch {
         $verifiedUser = $null
-        Write-Log 'WARN' ("User '{0}' was created but could not be re-read for display: {1}" -f $userName, $_.Exception.Message)
+        Write-Log 'ERROR' ("Could not retrieve created user '{0}': {1}" -f $userName, $_.Exception.Message)
+        $exitCode = 1
+    }
+
+    if ($exitCode -eq 0 -and $null -eq $verifiedUser) {
+        Write-Log 'ERROR' ("User '{0}' was created but could not be found afterwards." -f $userName)
+        $exitCode = 1
+    }
+
+    if ($exitCode -eq 0) {
+        $userId = $verifiedUser.id
+        if ($null -eq $userId -or [string]::IsNullOrWhiteSpace([string]$userId)) {
+            Write-Log 'ERROR' ("User '{0}' was retrieved but no user ID was returned." -f $userName)
+            $exitCode = 1
+        }
+    }
+}
+
+# Set password to never expire and grant AuditUsers authorization
+if ($exitCode -eq 0) {
+    Write-Log 'INFO' ("Updating user '{0}' to set password never expires and AuditUsers authorization..." -f $userName)
+
+    try {
+        $null = Set-PASUser -id $userId -username $userName -passwordNeverExpires $true -vaultAuthorization @('AuditUsers')
+        Write-Log 'INFO' ("User '{0}' updated successfully." -f $userName)
+    } catch {
+        Write-Log 'ERROR' ("Could not update user '{0}': {1}" -f $userName, $_.Exception.Message)
+        $exitCode = 1
+    }
+}
+
+# Verify final user settings
+if ($exitCode -eq 0) {
+    Write-Log 'INFO' 'Verifying final user settings...'
+
+    try {
+        $verifiedUser = Get-PASUser -UserName $userName
+    } catch {
+        $verifiedUser = $null
+        Write-Log 'WARN' ("User '{0}' was updated but could not be re-read for display: {1}" -f $userName, $_.Exception.Message)
     }
 
     # Display the user details
@@ -246,6 +286,10 @@ if ($exitCode -eq 0) {
         Write-Output 'User Details:'
         Write-Output ('=' * 80)
         Write-Output ("  UserName: {0}" -f $verifiedUser.username)
+
+        if ($verifiedUser.id) {
+            Write-Output ("  ID: {0}" -f $verifiedUser.id)
+        }
 
         if ($verifiedUser.userType) {
             Write-Output ("  UserType: {0}" -f $verifiedUser.userType)
@@ -259,13 +303,17 @@ if ($exitCode -eq 0) {
             Write-Output ("  Enabled: {0}" -f $verifiedUser.enableUser)
         }
 
+        if ($null -ne $verifiedUser.passwordNeverExpires) {
+            Write-Output ("  PasswordNeverExpires: {0}" -f $verifiedUser.passwordNeverExpires)
+        }
+
         if ($verifiedUser.vaultAuthorization) {
             Write-Output ("  Vault Authorization: {0}" -f (@($verifiedUser.vaultAuthorization) -join ', '))
         }
 
         Write-Output ('=' * 80)
     } else {
-        Write-Log 'WARN' ("User '{0}' was created but could not be re-read for display." -f $userName)
+        Write-Log 'WARN' ("User '{0}' was created and updated but could not be re-read for display." -f $userName)
     }
 }
 
