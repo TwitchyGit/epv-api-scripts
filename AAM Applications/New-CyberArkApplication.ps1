@@ -1,12 +1,12 @@
 <#
 .SYNOPSIS
-    Adds a new application to CyberArk.
+    Adds a new application to CyberArk using psPAS.
 
 .DESCRIPTION
-    This script authenticates to CyberArk and creates a new application in the Vault.
+    This script authenticates with psPAS and creates a new application in the Vault.
 
 .PARAMETER PVWAUrl
-    The base URL of the CyberArk PVWA (e.g. https://pvwa.company.com)
+    The base URL of the CyberArk PVWA (e.g. https://pvwa.company.com or https://pvwa.company.com/PasswordVault)
 
 .PARAMETER Credential
     PSCredential object for CyberArk authentication. If not provided, will prompt.
@@ -19,6 +19,7 @@
 
 .PARAMETER Location
     Optional location of the application in the Vault hierarchy.
+    If not supplied, "\" will be used.
 
 .PARAMETER AccessPermittedFrom
     Optional start hour that access is permitted (0-23).
@@ -27,7 +28,7 @@
     Optional end hour that access is permitted (0-23).
 
 .PARAMETER ExpirationDate
-    Optional expiration date of the application (mm-dd-yyyy format).
+    Optional expiration date of the application in mm-dd-yyyy format.
 
 .PARAMETER Disabled
     Optional flag to create the application as disabled. Default is $false.
@@ -45,18 +46,28 @@
     Optional business owner phone number.
 
 .PARAMETER DisableCertificateValidation
-    Disables SSL certificate validation. Use only for testing with self-signed certificates.
+    Skips certificate checks in New-PASSession. Use only for testing.
+
+.PARAMETER AuthenticationType
+    Authentication type for New-PASSession: cyberark, ldap, or radius.
+
+.PARAMETER OTP
+    OTP for RADIUS authentication.
+
+.PARAMETER LogonToken
+    Existing psPAS session object from Get-PASSession / New-PASSession.
+    If provided, the script will reuse it and will NOT log off.
 
 .EXAMPLE
     $cred = Get-Credential
-    .\New-CyberArkApplication.ps1 -PVWAUrl "https://pvwa.company.com" `
+    .\New-CyberArkApplication.ps1 -PVWAUrl "https://pvwa.company.com/PasswordVault" `
         -Credential $cred `
         -AppID "MyNewApp" `
         -Description "My application for testing" `
         -Location "\Applications"
 
 .EXAMPLE
-    .\New-CyberArkApplication.ps1 -PVWAUrl "https://pvwa.company.com" `
+    .\New-CyberArkApplication.ps1 -PVWAUrl "https://pvwa.company.com/PasswordVault" `
         -AppID "MyNewApp" `
         -BusinessOwnerFName "John" `
         -BusinessOwnerLName "Doe" `
@@ -116,9 +127,9 @@ param(
     [Parameter(Mandatory = $false, HelpMessage = 'Enter the RADIUS OTP')]
     [string]$OTP,
 
-    [Parameter(Mandatory = $false, HelpMessage = 'Use this parameter to pass a pre-existing authorization token. If passed the token is NOT logged off')]
+    [Parameter(Mandatory = $false, HelpMessage = 'Pass an existing psPAS session object. If passed the session is NOT logged off')]
     [Alias('session', 'sessionToken')]
-    [string]$LogonToken
+    [object]$LogonToken
 )
 
 function Write-Log {
@@ -127,112 +138,25 @@ function Write-Log {
         [string]$Message
     )
 
-    # Simple logging
     Write-Output ("{0} {1}" -f $Level.ToUpper().PadRight(5), $Message)
 }
 
-function Convert-SecureStringToPlainText {
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.Security.SecureString]$SecureString
-    )
-
-    # Convert SecureString for API logon
-    $bstr = $null
-    $plainText = $null
-
-    try {
-        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-        $plainText = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
-    } finally {
-        if ($bstr) {
-            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-        }
-    }
-
-    return $plainText
-}
-
-function ConvertTo-URL {
-    param(
-        [string]$Text
-    )
-
-    # Encode values for URLs
-    if (-not [string]::IsNullOrWhiteSpace($Text)) {
-        return [URI]::EscapeDataString($Text)
-    }
-
-    return $Text
-}
-
-function Normalize-HeaderValue {
-    param(
-        [AllowNull()]
-        [string]$Value
-    )
-
-    if ($null -eq $Value) {
-        return $null
-    }
-
-    return (($Value -replace "`r", '') -replace "`n", '').Trim()
-}
-
-function Test-AuthResponseIsHtml {
-    param(
-        [AllowNull()]
-        [string]$Value
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        return $false
-    }
-
-    return ($Value -match '(?is)<html|<!DOCTYPE|<body|<form|<head')
-}
-
-function Invoke-CyberArkRest {
-    param(
-        [Parameter(Mandatory = $true)]
-        [ValidateSet('GET', 'POST')]
-        [string]$Method,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Uri,
-
-        [Parameter(Mandatory = $false)]
-        [hashtable]$Headers,
-
-        [Parameter(Mandatory = $false)]
-        [string]$Body
-    )
-
-    # Consistent REST wrapper
-    $safeUri = (($Uri -replace "`r", '') -replace "`n", '').Trim()
-
-    if ([string]::IsNullOrWhiteSpace($Body)) {
-        return Invoke-RestMethod -Uri $safeUri -Method $Method -Headers $Headers -ContentType 'application/json' -ErrorAction Stop
-    } else {
-        return Invoke-RestMethod -Uri $safeUri -Method $Method -Headers $Headers -Body $Body -ContentType 'application/json' -ErrorAction Stop
-    }
-}
-
-# Initial state
 $exitCode = 0
-$sessionToken = $null
 $shouldLogoff = $true
-$plainPassword = $null
-$headers = @{}
+$parsedExpirationDate = $null
+$targetLocation = $null
 
-# Normalize URL once
 $PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
 $AppID = $AppID.Trim()
+
+if (-not [string]::IsNullOrWhiteSpace($Location)) {
+    $Location = $Location.Trim()
+}
+
 if (-not [string]::IsNullOrWhiteSpace($OTP)) {
     $OTP = $OTP.Trim()
 }
 
-# Basic validation
 if ([string]::IsNullOrWhiteSpace($AppID)) {
     Write-Log 'ERROR' 'AppID cannot be blank.'
     exit 1
@@ -249,143 +173,79 @@ if ($AuthenticationType -eq 'radius' -and [string]::IsNullOrWhiteSpace($OTP)) {
 }
 
 if (-not [string]::IsNullOrWhiteSpace($ExpirationDate)) {
-    $parsedDate = $null
-    if (-not [datetime]::TryParseExact($ExpirationDate, 'MM-dd-yyyy', $null, [System.Globalization.DateTimeStyles]::None, [ref]$parsedDate)) {
+    if (-not [datetime]::TryParseExact($ExpirationDate, 'MM-dd-yyyy', $null, [System.Globalization.DateTimeStyles]::None, [ref]$parsedExpirationDate)) {
         Write-Log 'ERROR' 'ExpirationDate must be in MM-dd-yyyy format.'
         exit 1
     }
 }
 
-# Optional certificate validation bypass
-if ($DisableCertificateValidation) {
-    Write-Log 'WARN' 'Certificate validation is disabled. Use only for testing.'
-
-    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint srvPoint,
-        X509Certificate certificate,
-        WebRequest request,
-        int certificateProblem) {
-        return true;
-    }
-}
-"@
-    }
-
-    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+$targetLocation = '\'
+if (-not [string]::IsNullOrWhiteSpace($Location)) {
+    $targetLocation = $Location
 }
 
-# Ensure TLS 1.2 is enabled
-if (([Net.ServicePointManager]::SecurityProtocol -band [Net.SecurityProtocolType]::Tls12) -eq 0) {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+if (-not (Get-Module -ListAvailable -Name psPAS)) {
+    Write-Log 'ERROR' 'psPAS module is not installed or not available.'
+    exit 1
 }
 
-# Authentication and session handling
-if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
-    $sessionToken = Normalize-HeaderValue -Value $LogonToken
-    $shouldLogoff = $false
-    Write-Log 'INFO' 'Using provided session token. Script will not log off.'
-} else {
-    if (-not $Credential) {
-        $Credential = Get-Credential -Message 'Enter CyberArk credentials'
-    }
-
-    if (-not $Credential) {
-        Write-Log 'ERROR' 'Credentials are required to proceed.'
-        exit 1
-    }
-
-    $userName = $Credential.UserName
-    $plainPassword = Convert-SecureStringToPlainText -SecureString $Credential.Password
-
-    if ([string]::IsNullOrWhiteSpace($plainPassword)) {
-        Write-Log 'ERROR' 'Password could not be extracted from credential object.'
-        exit 1
-    }
-
-    Write-Log 'INFO' ("Authenticating to CyberArk using {0}..." -f $AuthenticationType)
-
-    $passwordToSend = $plainPassword
-    if ($AuthenticationType -eq 'radius') {
-        $passwordToSend = '{0},{1}' -f $plainPassword, $OTP
-    }
-
-    # Do not log this body
-    $authBody = @{
-        username          = $userName
-        password          = $passwordToSend
-        concurrentSession = $true
-    } | ConvertTo-Json
-
-    $authUrl = "{0}/API/Auth/{1}/Logon" -f $PVWAUrl, $AuthenticationType
-
-    try {
-        $authResponse = Invoke-CyberArkRest -Method POST -Uri $authUrl -Body $authBody
-        $sessionToken = Normalize-HeaderValue -Value ([string]$authResponse)
-
-        if ([string]::IsNullOrWhiteSpace($sessionToken)) {
-            Write-Log 'ERROR' ("Authentication did not return a token. URL used: {0}" -f $authUrl)
-            exit 1
-        }
-
-        if (Test-AuthResponseIsHtml -Value $sessionToken) {
-            Write-Log 'ERROR' ("Authentication returned HTML instead of a token. URL used: {0}" -f $authUrl)
-            exit 1
-        }
-
-        Write-Log 'INFO' 'Authentication successful.'
-    } catch {
-        Write-Log 'ERROR' ("Authentication failed: {0}" -f $_.Exception.Message)
-        if ($_.ErrorDetails.Message) {
-            Write-Log 'ERROR' ("API Error Details: {0}" -f $_.ErrorDetails.Message)
-        }
-        exit 1
-    }
-}
-
-# Headers for subsequent calls
-$headers = @{
-    Authorization = (Normalize-HeaderValue -Value $sessionToken)
-    'Content-Type' = 'application/json'
-}
-
-# Encode AppID for URL safety
-$appIdEncoded = ConvertTo-URL -Text $AppID
-
-# Gen1 application endpoints
-$checkUrl = "{0}/WebServices/PIMServices.svc/Applications/{1}/" -f $PVWAUrl, $appIdEncoded
-$createAppUrl = "{0}/WebServices/PIMServices.svc/Applications/" -f $PVWAUrl
+Import-Module psPAS -ErrorAction Stop
 
 try {
-    # Check whether application already exists
+    if ($null -ne $LogonToken) {
+        if ($LogonToken -is [string]) {
+            Write-Log 'ERROR' 'For psPAS, LogonToken must be a psPAS session object from Get-PASSession, not a raw token string.'
+            exit 1
+        }
+
+        Use-PASSession -Session $LogonToken
+        $shouldLogoff = $false
+        Write-Log 'INFO' 'Using provided psPAS session. Script will not log off.'
+    } else {
+        if (-not $Credential) {
+            $Credential = Get-Credential -Message 'Enter CyberArk credentials'
+        }
+
+        if (-not $Credential) {
+            Write-Log 'ERROR' 'Credentials are required to proceed.'
+            exit 1
+        }
+
+        Write-Log 'INFO' ("Authenticating with psPAS using {0}..." -f $AuthenticationType)
+
+        $sessionParams = @{
+            BaseURI          = $PVWAUrl
+            Credential       = $Credential
+            Type             = $AuthenticationType
+            SkipVersionCheck = $true
+        }
+
+        if ($DisableCertificateValidation) {
+            $sessionParams['SkipCertificateCheck'] = $true
+        }
+
+        if ($AuthenticationType -eq 'radius' -and -not [string]::IsNullOrWhiteSpace($OTP)) {
+            $sessionParams['OTP'] = $OTP
+        }
+
+        $null = New-PASSession @sessionParams
+        Write-Log 'INFO' 'Authentication successful.'
+    }
+
     Write-Log 'INFO' ("Checking if application '{0}' already exists..." -f $AppID)
 
-    $appExists = $false
-
+    $existingApp = $null
     try {
-        $existingApp = Invoke-CyberArkRest -Method GET -Uri $checkUrl -Headers $headers
-        if ($null -ne $existingApp) {
-            $appExists = $true
-        }
+        $existingApp = Get-PASApplication -Search $AppID
     } catch {
-        $statusCode = $null
+        $existingApp = $null
+    }
 
-        try {
-            if ($_.Exception.Response) {
-                $statusCode = [int]$_.Exception.Response.StatusCode
-            }
-        } catch {
-            $statusCode = $null
-        }
-
-        if ($statusCode -eq 404 -or $_.Exception.Message -match '404') {
-            Write-Log 'INFO' 'Application does not exist. Proceeding with creation.'
-        } else {
-            throw
+    $appExists = $false
+    if ($existingApp) {
+        $matchingApps = @($existingApp | Where-Object { $_.AppID -eq $AppID })
+        if ($matchingApps.Count -gt 0) {
+            $appExists = $true
         }
     }
 
@@ -394,111 +254,88 @@ try {
         $exitCode = 1
     }
 
-    # Prepare application object
     if ($exitCode -eq 0) {
-        $applicationObject = @{
+        $addParams = @{
             AppID    = $AppID
+            Location = $targetLocation
             Disabled = $Disabled
         }
 
-        if (-not [string]::IsNullOrWhiteSpace($Description)) { $applicationObject['Description'] = $Description.Trim() }
-        if (-not [string]::IsNullOrWhiteSpace($Location)) { $applicationObject['Location'] = $Location.Trim() }
-        if ($PSBoundParameters.ContainsKey('AccessPermittedFrom')) { $applicationObject['AccessPermittedFrom'] = $AccessPermittedFrom }
-        if ($PSBoundParameters.ContainsKey('AccessPermittedTo')) { $applicationObject['AccessPermittedTo'] = $AccessPermittedTo }
-        if (-not [string]::IsNullOrWhiteSpace($ExpirationDate)) { $applicationObject['ExpirationDate'] = $ExpirationDate.Trim() }
-        if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerFName)) { $applicationObject['BusinessOwnerFName'] = $BusinessOwnerFName.Trim() }
-        if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerLName)) { $applicationObject['BusinessOwnerLName'] = $BusinessOwnerLName.Trim() }
-        if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerEmail)) { $applicationObject['BusinessOwnerEmail'] = $BusinessOwnerEmail.Trim() }
-        if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerPhone)) { $applicationObject['BusinessOwnerPhone'] = $BusinessOwnerPhone.Trim() }
+        if (-not [string]::IsNullOrWhiteSpace($Description)) { $addParams['Description'] = $Description.Trim() }
+        if ($PSBoundParameters.ContainsKey('AccessPermittedFrom')) { $addParams['AccessPermittedFrom'] = $AccessPermittedFrom }
+        if ($PSBoundParameters.ContainsKey('AccessPermittedTo')) { $addParams['AccessPermittedTo'] = $AccessPermittedTo }
+        if ($null -ne $parsedExpirationDate) { $addParams['ExpirationDate'] = $parsedExpirationDate }
+        if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerFName)) { $addParams['BusinessOwnerFName'] = $BusinessOwnerFName.Trim() }
+        if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerLName)) { $addParams['BusinessOwnerLName'] = $BusinessOwnerLName.Trim() }
+        if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerEmail)) { $addParams['BusinessOwnerEmail'] = $BusinessOwnerEmail.Trim() }
+        if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerPhone)) { $addParams['BusinessOwnerPhone'] = $BusinessOwnerPhone.Trim() }
 
-        $requestBody = @{
-            application = $applicationObject
-        } | ConvertTo-Json -Depth 5
-
-        # Create application
         Write-Log 'INFO' ("Creating application '{0}'..." -f $AppID)
-        $null = Invoke-CyberArkRest -Method POST -Uri $createAppUrl -Headers $headers -Body $requestBody
+        $null = Add-PASApplication @addParams
         Write-Log 'INFO' ("Application '{0}' created successfully." -f $AppID)
 
-        # Verify application creation
         Write-Log 'INFO' 'Verifying application was created...'
-        $verifiedApp = Invoke-CyberArkRest -Method GET -Uri $checkUrl -Headers $headers
+        $verifiedApp = $null
+        $verifiedApp = Get-PASApplication -Search $AppID | Where-Object { $_.AppID -eq $AppID } | Select-Object -First 1
 
-        $app = $null
-        if ($verifiedApp.application) {
-            if ($verifiedApp.application -is [array]) {
-                $app = $verifiedApp.application[0]
-            } else {
-                $app = $verifiedApp.application
-            }
-        } else {
-            $app = $verifiedApp
-        }
-
-        if ($null -ne $app) {
+        if ($null -ne $verifiedApp) {
             Write-Output ''
             Write-Output 'Application Details:'
             Write-Output ('=' * 80)
-            Write-Output ("  AppID: {0}" -f $app.AppID)
+            Write-Output ("  AppID: {0}" -f $verifiedApp.AppID)
 
-            if ($app.Description) {
-                Write-Output ("  Description: {0}" -f $app.Description)
+            if ($verifiedApp.Description) {
+                Write-Output ("  Description: {0}" -f $verifiedApp.Description)
             }
 
-            if ($app.Location) {
-                Write-Output ("  Location: {0}" -f $app.Location)
+            if ($verifiedApp.Location) {
+                Write-Output ("  Location: {0}" -f $verifiedApp.Location)
             }
 
-            Write-Output ("  Disabled: {0}" -f $app.Disabled)
+            Write-Output ("  Disabled: {0}" -f $verifiedApp.Disabled)
 
-            if ($null -ne $app.AccessPermittedFrom -or $null -ne $app.AccessPermittedTo) {
-                Write-Output ("  Access Hours: {0} - {1}" -f $app.AccessPermittedFrom, $app.AccessPermittedTo)
+            if ($null -ne $verifiedApp.AccessPermittedFrom -or $null -ne $verifiedApp.AccessPermittedTo) {
+                Write-Output ("  Access Hours: {0} - {1}" -f $verifiedApp.AccessPermittedFrom, $verifiedApp.AccessPermittedTo)
             }
 
-            if ($app.ExpirationDate) {
-                Write-Output ("  Expiration Date: {0}" -f $app.ExpirationDate)
+            if ($verifiedApp.ExpirationDate) {
+                Write-Output ("  Expiration Date: {0}" -f $verifiedApp.ExpirationDate)
             }
 
-            if ($app.BusinessOwnerFName -or $app.BusinessOwnerLName) {
-                Write-Output ("  Business Owner: {0} {1}" -f $app.BusinessOwnerFName, $app.BusinessOwnerLName)
+            if ($verifiedApp.BusinessOwnerFName -or $verifiedApp.BusinessOwnerLName) {
+                Write-Output ("  Business Owner: {0} {1}" -f $verifiedApp.BusinessOwnerFName, $verifiedApp.BusinessOwnerLName)
             }
 
-            if ($app.BusinessOwnerEmail) {
-                Write-Output ("  Business Owner Email: {0}" -f $app.BusinessOwnerEmail)
+            if ($verifiedApp.BusinessOwnerEmail) {
+                Write-Output ("  Business Owner Email: {0}" -f $verifiedApp.BusinessOwnerEmail)
             }
 
-            if ($app.BusinessOwnerPhone) {
-                Write-Output ("  Business Owner Phone: {0}" -f $app.BusinessOwnerPhone)
+            if ($verifiedApp.BusinessOwnerPhone) {
+                Write-Output ("  Business Owner Phone: {0}" -f $verifiedApp.BusinessOwnerPhone)
             }
 
             Write-Output ('=' * 80)
+        } else {
+            Write-Log 'WARN' ("Application '{0}' was created but could not be re-read for display." -f $AppID)
         }
     }
 } catch {
     $exitCode = 1
     Write-Output ''
     Write-Log 'ERROR' ("Error occurred: {0}" -f $_.Exception.Message)
-
-    if ($_.ErrorDetails.Message) {
-        Write-Log 'ERROR' ("API Error Details: {0}" -f $_.ErrorDetails.Message)
-    }
 } finally {
-    # Log off if we created the session
-    if ($shouldLogoff -and -not [string]::IsNullOrWhiteSpace($sessionToken)) {
+    if ($shouldLogoff) {
         try {
             Write-Log 'INFO' 'Logging off...'
-            $logoffUrl = "{0}/API/Auth/Logoff" -f $PVWAUrl
-            $null = Invoke-CyberArkRest -Method POST -Uri $logoffUrl -Headers @{ Authorization = (Normalize-HeaderValue -Value $sessionToken) }
+            Close-PASSession
             Write-Log 'INFO' 'Session closed successfully.'
         } catch {
             Write-Log 'WARN' ("Could not close session properly: {0}" -f $_.Exception.Message)
         }
     } else {
-        Write-Log 'INFO' 'Session token was provided. Not logging off.'
+        Write-Log 'INFO' 'psPAS session was provided. Not logging off.'
     }
 
-    # Clear sensitive references
-    $plainPassword = $null
     $Credential = $null
 
     exit $exitCode
