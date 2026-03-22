@@ -166,6 +166,32 @@ function ConvertTo-URL {
     return $Text
 }
 
+function Normalize-HeaderValue {
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    return (($Value -replace "`r", '') -replace "`n", '').Trim()
+}
+
+function Test-AuthResponseIsHtml {
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+
+    return ($Value -match '(?is)<html|<!DOCTYPE|<body|<form|<head')
+}
+
 function Invoke-CyberArkRest {
     param(
         [Parameter(Mandatory = $true)]
@@ -183,10 +209,12 @@ function Invoke-CyberArkRest {
     )
 
     # Consistent REST wrapper
+    $safeUri = (($Uri -replace "`r", '') -replace "`n", '').Trim()
+
     if ([string]::IsNullOrWhiteSpace($Body)) {
-        return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -ContentType 'application/json' -ErrorAction Stop
+        return Invoke-RestMethod -Uri $safeUri -Method $Method -Headers $Headers -ContentType 'application/json' -ErrorAction Stop
     } else {
-        return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $Body -ContentType 'application/json' -ErrorAction Stop
+        return Invoke-RestMethod -Uri $safeUri -Method $Method -Headers $Headers -Body $Body -ContentType 'application/json' -ErrorAction Stop
     }
 }
 
@@ -199,6 +227,10 @@ $headers = @{}
 
 # Normalize URL once
 $PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
+$AppID = $AppID.Trim()
+if (-not [string]::IsNullOrWhiteSpace($OTP)) {
+    $OTP = $OTP.Trim()
+}
 
 # Basic validation
 if ([string]::IsNullOrWhiteSpace($AppID)) {
@@ -254,7 +286,7 @@ if (([Net.ServicePointManager]::SecurityProtocol -band [Net.SecurityProtocolType
 
 # Authentication and session handling
 if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
-    $sessionToken = $LogonToken.Trim()
+    $sessionToken = Normalize-HeaderValue -Value $LogonToken
     $shouldLogoff = $false
     Write-Log 'INFO' 'Using provided session token. Script will not log off.'
 } else {
@@ -279,7 +311,7 @@ if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
 
     $passwordToSend = $plainPassword
     if ($AuthenticationType -eq 'radius') {
-        $passwordToSend = '{0},{1}' -f $plainPassword, $OTP.Trim()
+        $passwordToSend = '{0},{1}' -f $plainPassword, $OTP
     }
 
     # Do not log this body
@@ -293,7 +325,18 @@ if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
 
     try {
         $authResponse = Invoke-CyberArkRest -Method POST -Uri $authUrl -Body $authBody
-        $sessionToken = [string]$authResponse
+        $sessionToken = Normalize-HeaderValue -Value ([string]$authResponse)
+
+        if ([string]::IsNullOrWhiteSpace($sessionToken)) {
+            Write-Log 'ERROR' ("Authentication did not return a token. URL used: {0}" -f $authUrl)
+            exit 1
+        }
+
+        if (Test-AuthResponseIsHtml -Value $sessionToken) {
+            Write-Log 'ERROR' ("Authentication returned HTML instead of a token. URL used: {0}" -f $authUrl)
+            exit 1
+        }
+
         Write-Log 'INFO' 'Authentication successful.'
     } catch {
         Write-Log 'ERROR' ("Authentication failed: {0}" -f $_.Exception.Message)
@@ -306,7 +349,7 @@ if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
 
 # Headers for subsequent calls
 $headers = @{
-    Authorization = $sessionToken
+    Authorization = (Normalize-HeaderValue -Value $sessionToken)
     'Content-Type' = 'application/json'
 }
 
@@ -445,7 +488,7 @@ try {
         try {
             Write-Log 'INFO' 'Logging off...'
             $logoffUrl = "{0}/API/Auth/Logoff" -f $PVWAUrl
-            $null = Invoke-CyberArkRest -Method POST -Uri $logoffUrl -Headers @{ Authorization = $sessionToken }
+            $null = Invoke-CyberArkRest -Method POST -Uri $logoffUrl -Headers @{ Authorization = (Normalize-HeaderValue -Value $sessionToken) }
             Write-Log 'INFO' 'Session closed successfully.'
         } catch {
             Write-Log 'WARN' ("Could not close session properly: {0}" -f $_.Exception.Message)
