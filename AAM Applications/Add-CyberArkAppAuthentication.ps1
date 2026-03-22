@@ -246,6 +246,32 @@ function Compare-NormalizedStringArrays {
     return $true
 }
 
+function Normalize-HeaderValue {
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    return (($Value -replace "`r", '') -replace "`n", '').Trim()
+}
+
+function Test-AuthResponseIsHtml {
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+
+    return ($Value -match '(?is)<html|<!DOCTYPE|<body|<form|<head')
+}
+
 function Invoke-CyberArkRest {
     param(
         [Parameter(Mandatory = $true)]
@@ -263,10 +289,12 @@ function Invoke-CyberArkRest {
     )
 
     # Small wrapper so all REST calls are consistent
+    $safeUri = (($Uri -replace "`r", '') -replace "`n", '').Trim()
+
     if ([string]::IsNullOrWhiteSpace($Body)) {
-        return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -ErrorAction Stop
+        return Invoke-RestMethod -Uri $safeUri -Method $Method -Headers $Headers -ErrorAction Stop
     } else {
-        return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $Body -ContentType 'application/json' -ErrorAction Stop
+        return Invoke-RestMethod -Uri $safeUri -Method $Method -Headers $Headers -Body $Body -ContentType 'application/json' -ErrorAction Stop
     }
 }
 
@@ -281,6 +309,10 @@ $authMethodsToAdd = @()
 
 # Normalize URL once at the start
 $PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
+$AppID = $AppID.Trim()
+if (-not [string]::IsNullOrWhiteSpace($OTP)) {
+    $OTP = $OTP.Trim()
+}
 
 
 # Basic validation
@@ -453,7 +485,7 @@ if ($CertificateIssuer -or $CertificateSubject -or $CertificateSubjectAlternativ
 # Authentication / session handling
 if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
     # Reuse caller-provided token
-    $sessionToken = $LogonToken.Trim()
+    $sessionToken = Normalize-HeaderValue -Value $LogonToken
     $shouldLogoff = $false
     Write-Log 'INFO' 'Using provided session token. Script will not log off.'
 } else {
@@ -481,7 +513,7 @@ if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
     # RADIUS uses password,OTP format
     $passwordToSend = $plainPassword
     if ($AuthenticationType -eq 'radius') {
-        $passwordToSend = '{0},{1}' -f $plainPassword, $OTP.Trim()
+        $passwordToSend = '{0},{1}' -f $plainPassword, $OTP
     }
 
     # Build logon body
@@ -496,7 +528,18 @@ if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
 
     try {
         $authResponse = Invoke-CyberArkRest -Uri $authUrl -Method Post -Body $authBody
-        $sessionToken = [string]$authResponse
+        $sessionToken = Normalize-HeaderValue -Value ([string]$authResponse)
+
+        if ([string]::IsNullOrWhiteSpace($sessionToken)) {
+            Write-Log 'ERROR' ("Authentication did not return a token. URL used: {0}" -f $authUrl)
+            exit 1
+        }
+
+        if (Test-AuthResponseIsHtml -Value $sessionToken) {
+            Write-Log 'ERROR' ("Authentication returned HTML instead of a token. URL used: {0}" -f $authUrl)
+            exit 1
+        }
+
         Write-Log 'INFO' 'Authentication successful.'
     } catch {
         Write-Log 'ERROR' ("Authentication failed: {0}" -f $_.Exception.Message)
@@ -509,7 +552,7 @@ if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
 
 # Headers used for subsequent API calls
 $headers = @{
-    Authorization = $sessionToken
+    Authorization = (Normalize-HeaderValue -Value $sessionToken)
     'Content-Type' = 'application/json'
 }
 
@@ -721,7 +764,7 @@ if ($shouldLogoff -and -not [string]::IsNullOrWhiteSpace($sessionToken)) {
     try {
         Write-Log 'INFO' 'Logging off...'
         $logoffUrl = "{0}/API/Auth/Logoff" -f $PVWAUrl
-        $null = Invoke-CyberArkRest -Uri $logoffUrl -Method Post -Headers @{ Authorization = $sessionToken }
+        $null = Invoke-CyberArkRest -Uri $logoffUrl -Method Post -Headers @{ Authorization = (Normalize-HeaderValue -Value $sessionToken) }
         Write-Log 'INFO' 'Session closed successfully.'
     } catch {
         Write-Log 'WARN' ("Could not close session properly: {0}" -f $_.Exception.Message)
