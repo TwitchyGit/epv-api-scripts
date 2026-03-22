@@ -148,9 +148,9 @@ param(
     [Parameter(Mandatory = $false, HelpMessage = 'Enter the RADIUS OTP')]
     [string]$OTP,
 
-    [Parameter(Mandatory = $false, HelpMessage = 'Use this parameter to pass a pre-existing authorization token. If passed the token is NOT logged off')]
+    [Parameter(Mandatory = $false, HelpMessage = 'Pass an existing psPAS session object. If passed the session is NOT logged off')]
     [Alias('session', 'sessionToken')]
-    [string]$LogonToken
+    [object]$LogonToken
 )
 
 function Write-Log {
@@ -161,29 +161,6 @@ function Write-Log {
 
     # Simple operator-friendly logging
     Write-Output ("{0} {1}" -f $Level.ToUpper().PadRight(5), $Message)
-}
-
-function Convert-SecureStringToPlainText {
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.Security.SecureString]$SecureString
-    )
-
-    # Convert SecureString for API logon payload
-    # BSTR is zeroed immediately after use
-    $bstr = $null
-    $plainText = $null
-
-    try {
-        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-        $plainText = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
-    } finally {
-        if ($bstr) {
-            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-        }
-    }
-
-    return $plainText
 }
 
 function Normalize-Scalar {
@@ -246,66 +223,14 @@ function Compare-NormalizedStringArrays {
     return $true
 }
 
-function Normalize-HeaderValue {
-    param(
-        [AllowNull()]
-        [string]$Value
-    )
-
-    if ($null -eq $Value) {
-        return $null
-    }
-
-    return (($Value -replace "`r", '') -replace "`n", '').Trim()
-}
-
-function Test-AuthResponseIsHtml {
-    param(
-        [AllowNull()]
-        [string]$Value
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        return $false
-    }
-
-    return ($Value -match '(?is)<html|<!DOCTYPE|<body|<form|<head')
-}
-
-function Invoke-CyberArkRest {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Uri,
-
-        [Parameter(Mandatory = $true)]
-        [ValidateSet('Get', 'Post')]
-        [string]$Method,
-
-        [Parameter(Mandatory = $false)]
-        [hashtable]$Headers,
-
-        [Parameter(Mandatory = $false)]
-        [string]$Body
-    )
-
-    # Small wrapper so all REST calls are consistent
-    $safeUri = (($Uri -replace "`r", '') -replace "`n", '').Trim()
-
-    if ([string]::IsNullOrWhiteSpace($Body)) {
-        return Invoke-RestMethod -Uri $safeUri -Method $Method -Headers $Headers -ErrorAction Stop
-    } else {
-        return Invoke-RestMethod -Uri $safeUri -Method $Method -Headers $Headers -Body $Body -ContentType 'application/json' -ErrorAction Stop
-    }
-}
-
-
 # Initial state
 $exitCode = 0
-$sessionToken = $null
 $shouldLogoff = $true
-$plainPassword = $null
-$headers = @{}
 $authMethodsToAdd = @()
+$existingAuthMethods = @()
+$addedAuths = @()
+$skippedAuths = @()
+$failedAuths = @()
 
 # Normalize URL once at the start
 $PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
@@ -313,7 +238,6 @@ $AppID = $AppID.Trim()
 if (-not [string]::IsNullOrWhiteSpace($OTP)) {
     $OTP = $OTP.Trim()
 }
-
 
 # Basic validation
 if ([string]::IsNullOrWhiteSpace($AppID)) {
@@ -332,34 +256,14 @@ if ($AuthenticationType -eq 'radius' -and [string]::IsNullOrWhiteSpace($OTP)) {
     exit 1
 }
 
-
-# Optional certificate validation bypass
-if ($DisableCertificateValidation) {
-    Write-Log 'WARN' 'Certificate validation is disabled. Use only for testing.'
-
-    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint srvPoint,
-        X509Certificate certificate,
-        WebRequest request,
-        int certificateProblem) {
-        return true;
-    }
-}
-"@
-    }
-
-    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+# Confirm psPAS is available before doing anything else
+if (-not (Get-Module -ListAvailable -Name psPAS)) {
+    Write-Log 'ERROR' 'psPAS module is not installed or not available.'
+    exit 1
 }
 
-# Ensure TLS 1.2 is enabled without wiping other flags
-if (([Net.ServicePointManager]::SecurityProtocol -band [Net.SecurityProtocolType]::Tls12) -eq 0) {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-}
+# Import psPAS into the current session
+Import-Module psPAS -ErrorAction Stop
 
 # Build requested authentication methods
 
@@ -370,8 +274,7 @@ if ($Path) {
             $authMethodsToAdd += @{
                 Type   = 'Path'
                 Object = @{
-                    AuthType             = 'path'
-                    AuthValue            = $p.Trim()
+                    path                 = $p.Trim()
                     IsFolder             = $PathIsFolder
                     AllowInternalScripts = $PathAllowInternalScripts
                 }
@@ -385,8 +288,7 @@ if ($Hash) {
     foreach ($h in $Hash) {
         if (-not [string]::IsNullOrWhiteSpace($h)) {
             $authObj = @{
-                AuthType  = 'hash'
-                AuthValue = $h.Trim()
+                hash = $h.Trim()
             }
 
             if (-not [string]::IsNullOrWhiteSpace($HashComment)) {
@@ -408,8 +310,7 @@ if ($OSUser) {
             $authMethodsToAdd += @{
                 Type   = 'OSUser'
                 Object = @{
-                    AuthType  = 'osUser'
-                    AuthValue = $user.Trim()
+                    osUser = $user.Trim()
                 }
             }
         }
@@ -423,8 +324,7 @@ if ($MachineAddress) {
             $authMethodsToAdd += @{
                 Type   = 'MachineAddress'
                 Object = @{
-                    AuthType  = 'machineAddress'
-                    AuthValue = $addr.Trim()
+                    machineAddress = $addr.Trim()
                 }
             }
         }
@@ -436,8 +336,7 @@ if ($CertificateSerialNumber) {
     foreach ($serial in $CertificateSerialNumber) {
         if (-not [string]::IsNullOrWhiteSpace($serial)) {
             $authObj = @{
-                AuthType  = 'certificateserialnumber'
-                AuthValue = $serial.Trim()
+                certificateserialnumber = $serial.Trim()
             }
 
             if (-not [string]::IsNullOrWhiteSpace($CertificateSerialNumberComment)) {
@@ -454,9 +353,7 @@ if ($CertificateSerialNumber) {
 
 # Certificate Attributes authentication
 if ($CertificateIssuer -or $CertificateSubject -or $CertificateSubjectAlternativeName) {
-    $authObj = @{
-        AuthType = 'certificateattr'
-    }
+    $authObj = @{}
 
     # Normalize arrays before sending and duplicate checks
     $issuerValues = @(Normalize-StringArray -Values $CertificateIssuer)
@@ -481,13 +378,17 @@ if ($CertificateIssuer -or $CertificateSubject -or $CertificateSubjectAlternativ
     }
 }
 
-
 # Authentication / session handling
-if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
-    # Reuse caller-provided token
-    $sessionToken = Normalize-HeaderValue -Value $LogonToken
-    $shouldLogoff = $false
-    Write-Log 'INFO' 'Using provided session token. Script will not log off.'
+if ($null -ne $LogonToken) {
+    # Reuse caller-provided psPAS session
+    try {
+        Use-PASSession -Session $LogonToken
+        $shouldLogoff = $false
+        Write-Log 'INFO' 'Using provided psPAS session. Script will not log off.'
+    } catch {
+        Write-Log 'ERROR' ("Could not use provided psPAS session: {0}" -f $_.Exception.Message)
+        exit 1
+    }
 } else {
     # Prompt if credential not supplied
     if (-not $Credential) {
@@ -499,81 +400,44 @@ if (-not [string]::IsNullOrWhiteSpace($LogonToken)) {
         exit 1
     }
 
-    $userName = $Credential.UserName
-    $plainPassword = Convert-SecureStringToPlainText -SecureString $Credential.Password
+    Write-Log 'INFO' ("Authenticating with psPAS using {0}..." -f $AuthenticationType)
 
-    if ([string]::IsNullOrWhiteSpace($plainPassword)) {
-        Write-Log 'ERROR' 'Password could not be extracted from credential object.'
-        exit 1
+    # Build New-PASSession parameters
+    $sessionParams = @{
+        BaseURI          = $PVWAUrl
+        Credential       = $Credential
+        Type             = $AuthenticationType
+        SkipVersionCheck = $true
     }
 
-    Write-Log 'INFO' ("Authenticating to CyberArk using {0}..." -f $AuthenticationType)
+    # Optional certificate validation bypass
+    if ($DisableCertificateValidation) {
+        $sessionParams['SkipCertificateCheck'] = $true
+    }
 
-    # Build password string for logon
-    # RADIUS uses password,OTP format
-    $passwordToSend = $plainPassword
+    # Add OTP only for RADIUS
     if ($AuthenticationType -eq 'radius') {
-        $passwordToSend = '{0},{1}' -f $plainPassword, $OTP
+        $sessionParams['OTP'] = $OTP
     }
 
-    # Build logon body
-    # Do not log this body because it contains sensitive data
-    $authBody = @{
-        username          = $userName
-        password          = $passwordToSend
-        concurrentSession = $true
-    } | ConvertTo-Json
-
-    $authUrl = "{0}/API/Auth/{1}/Logon" -f $PVWAUrl, $AuthenticationType
-
+    # Create a new psPAS session
     try {
-        $authResponse = Invoke-CyberArkRest -Uri $authUrl -Method Post -Body $authBody
-        $sessionToken = Normalize-HeaderValue -Value ([string]$authResponse)
-
-        if ([string]::IsNullOrWhiteSpace($sessionToken)) {
-            Write-Log 'ERROR' ("Authentication did not return a token. URL used: {0}" -f $authUrl)
-            exit 1
-        }
-
-        if (Test-AuthResponseIsHtml -Value $sessionToken) {
-            Write-Log 'ERROR' ("Authentication returned HTML instead of a token. URL used: {0}" -f $authUrl)
-            exit 1
-        }
-
+        $null = New-PASSession @sessionParams
         Write-Log 'INFO' 'Authentication successful.'
     } catch {
         Write-Log 'ERROR' ("Authentication failed: {0}" -f $_.Exception.Message)
-        if ($_.ErrorDetails.Message) {
-            Write-Log 'ERROR' ("API Error Details: {0}" -f $_.ErrorDetails.Message)
-        }
         exit 1
     }
 }
 
-# Headers used for subsequent API calls
-$headers = @{
-    Authorization = (Normalize-HeaderValue -Value $sessionToken)
-    'Content-Type' = 'application/json'
-}
-
-# Encode AppID for URL safety
-$appIdEncoded = [uri]::EscapeDataString($AppID)
-
-# Gen1 application endpoints
-$appUrl = "{0}/WebServices/PIMServices.svc/Applications/{1}/" -f $PVWAUrl, $appIdEncoded
-$getAuthUrl = "{0}/WebServices/PIMServices.svc/Applications/{1}/Authentications/" -f $PVWAUrl, $appIdEncoded
-
-
 # Validate application exists
+Write-Log 'INFO' ("Validating application '{0}' exists..." -f $AppID)
+
 try {
-    Write-Log 'INFO' ("Validating application '{0}' exists..." -f $AppID)
-    $null = Invoke-CyberArkRest -Uri $appUrl -Method Get -Headers $headers
+    $null = Get-PASApplication -AppID $AppID -ExactMatch
     Write-Log 'INFO' ("Application '{0}' verified." -f $AppID)
 } catch {
     Write-Log 'ERROR' ("Could not validate application '{0}': {1}" -f $AppID, $_.Exception.Message)
-    if ($_.ErrorDetails.Message) {
-        Write-Log 'ERROR' ("API Error Details: {0}" -f $_.ErrorDetails.Message)
-    }
     $exitCode = 1
 }
 
@@ -582,34 +446,24 @@ if ($exitCode -eq 0 -and $authMethodsToAdd.Count -eq 0) {
     Write-Log 'INFO' 'No authentication methods were specified. Verification only completed successfully.'
 }
 
-
 # Read existing authentication methods
-$existingAuthMethods = @{ authentication = @() }
-
 if ($exitCode -eq 0 -and $authMethodsToAdd.Count -gt 0) {
-    try {
-        Write-Log 'INFO' ("Retrieving existing authentication methods for application '{0}'..." -f $AppID)
-        $existingAuthMethods = Invoke-CyberArkRest -Uri $getAuthUrl -Method Get -Headers $headers
+    Write-Log 'INFO' ("Retrieving existing authentication methods for application '{0}'..." -f $AppID)
 
-        # Some responses may not return an authentication property
-        if (-not $existingAuthMethods.authentication) {
-            $existingAuthMethods = @{ authentication = @() }
+    try {
+        $result = Get-PASApplicationAuthenticationMethod -AppID $AppID
+        if ($null -ne $result) {
+            $existingAuthMethods = @($result)
+        } else {
+            $existingAuthMethods = @()
         }
     } catch {
         Write-Log 'ERROR' ("Could not retrieve existing authentication methods: {0}" -f $_.Exception.Message)
-        if ($_.ErrorDetails.Message) {
-            Write-Log 'ERROR' ("API Error Details: {0}" -f $_.ErrorDetails.Message)
-        }
         $exitCode = 1
     }
 }
 
-
 # Add authentication methods
-$addedAuths = @()
-$skippedAuths = @()
-$failedAuths = @()
-
 if ($exitCode -eq 0 -and $authMethodsToAdd.Count -gt 0) {
     foreach ($authMethod in $authMethodsToAdd) {
         $authType = $authMethod.Type
@@ -617,7 +471,7 @@ if ($exitCode -eq 0 -and $authMethodsToAdd.Count -gt 0) {
         $isDuplicate = $false
 
         # Check for duplicates before add
-        foreach ($existing in $existingAuthMethods.authentication) {
+        foreach ($existing in $existingAuthMethods) {
             if ($authType -eq 'CertificateAttr' -and (Normalize-Scalar $existing.AuthType) -eq 'certificateattr') {
                 # Certificate attributes use array comparisons
                 $existingSubject = @()
@@ -638,8 +492,32 @@ if ($exitCode -eq 0 -and $authMethodsToAdd.Count -gt 0) {
                 }
             } else {
                 # All other types compare AuthType + AuthValue
-                if ((Normalize-Scalar $existing.AuthType) -eq (Normalize-Scalar $authObj.AuthType) -and
-                    (Normalize-Scalar $existing.AuthValue) -eq (Normalize-Scalar $authObj.AuthValue)) {
+                if ((Normalize-Scalar $existing.AuthType) -eq 'path' -and $authType -eq 'Path' -and
+                    (Normalize-Scalar $existing.AuthValue) -eq (Normalize-Scalar $authObj.path)) {
+                    $isDuplicate = $true
+                    break
+                }
+
+                if ((Normalize-Scalar $existing.AuthType) -eq 'hash' -and $authType -eq 'Hash' -and
+                    (Normalize-Scalar $existing.AuthValue) -eq (Normalize-Scalar $authObj.hash)) {
+                    $isDuplicate = $true
+                    break
+                }
+
+                if ((Normalize-Scalar $existing.AuthType) -eq 'osuser' -and $authType -eq 'OSUser' -and
+                    (Normalize-Scalar $existing.AuthValue) -eq (Normalize-Scalar $authObj.osUser)) {
+                    $isDuplicate = $true
+                    break
+                }
+
+                if ((Normalize-Scalar $existing.AuthType) -eq 'machineaddress' -and $authType -eq 'MachineAddress' -and
+                    (Normalize-Scalar $existing.AuthValue) -eq (Normalize-Scalar $authObj.machineAddress)) {
+                    $isDuplicate = $true
+                    break
+                }
+
+                if ((Normalize-Scalar $existing.AuthType) -eq 'certificateserialnumber' -and $authType -eq 'CertificateSerialNumber' -and
+                    (Normalize-Scalar $existing.AuthValue) -eq (Normalize-Scalar $authObj.certificateserialnumber)) {
                     $isDuplicate = $true
                     break
                 }
@@ -648,9 +526,11 @@ if ($exitCode -eq 0 -and $authMethodsToAdd.Count -gt 0) {
 
         # Friendly value for output
         $displayValue = 'Certificate Attributes'
-        if ($authObj.ContainsKey('AuthValue') -and -not [string]::IsNullOrWhiteSpace($authObj.AuthValue)) {
-            $displayValue = $authObj.AuthValue
-        }
+        if ($authType -eq 'Path') { $displayValue = $authObj.path }
+        if ($authType -eq 'Hash') { $displayValue = $authObj.hash }
+        if ($authType -eq 'OSUser') { $displayValue = $authObj.osUser }
+        if ($authType -eq 'MachineAddress') { $displayValue = $authObj.machineAddress }
+        if ($authType -eq 'CertificateSerialNumber') { $displayValue = $authObj.certificateserialnumber }
 
         if ($isDuplicate) {
             $skippedAuths += ("{0}: {1} (duplicate)" -f $authType, $displayValue)
@@ -658,26 +538,58 @@ if ($exitCode -eq 0 -and $authMethodsToAdd.Count -gt 0) {
             continue
         }
 
-        # Build add body
-        $requestBody = @{
-            authentication = $authObj
-        } | ConvertTo-Json -Depth 6
-
+        # Add each authentication method using the relevant psPAS parameter set
         try {
             Write-Log 'INFO' ("Adding {0} authentication: {1}" -f $authType, $displayValue)
-            $null = Invoke-CyberArkRest -Uri $getAuthUrl -Method Post -Headers $headers -Body $requestBody
+
+            if ($authType -eq 'Path') {
+                $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -path $authObj.path -IsFolder $authObj.IsFolder -AllowInternalScripts $authObj.AllowInternalScripts
+            }
+
+            if ($authType -eq 'Hash') {
+                if ($authObj.ContainsKey('Comment')) {
+                    $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -hash $authObj.hash -Comment $authObj.Comment
+                } else {
+                    $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -hash $authObj.hash
+                }
+            }
+
+            if ($authType -eq 'OSUser') {
+                $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -osUser $authObj.osUser
+            }
+
+            if ($authType -eq 'MachineAddress') {
+                $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -machineAddress $authObj.machineAddress
+            }
+
+            if ($authType -eq 'CertificateSerialNumber') {
+                if ($authObj.ContainsKey('Comment')) {
+                    $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -certificateserialnumber $authObj.certificateserialnumber -Comment $authObj.Comment
+                } else {
+                    $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -certificateserialnumber $authObj.certificateserialnumber
+                }
+            }
+
+            if ($authType -eq 'CertificateAttr') {
+                $addAttrParams = @{
+                    AppID = $AppID
+                }
+
+                if ($authObj.ContainsKey('Subject')) { $addAttrParams['Subject'] = $authObj.Subject }
+                if ($authObj.ContainsKey('Issuer')) { $addAttrParams['Issuer'] = $authObj.Issuer }
+                if ($authObj.ContainsKey('SubjectAlternativeName')) { $addAttrParams['SubjectAlternativeName'] = $authObj.SubjectAlternativeName }
+
+                $null = Add-PASApplicationAuthenticationMethod @addAttrParams
+            }
+
             $addedAuths += ("{0}: {1}" -f $authType, $displayValue)
             Write-Log 'INFO' ("Successfully added {0} authentication: {1}" -f $authType, $displayValue)
         } catch {
             $failedAuths += ("{0}: {1} - {2}" -f $authType, $displayValue, $_.Exception.Message)
             Write-Log 'ERROR' ("Failed to add {0} authentication: {1}" -f $authType, $_.Exception.Message)
-            if ($_.ErrorDetails.Message) {
-                Write-Log 'ERROR' ("API Error Details: {0}" -f $_.ErrorDetails.Message)
-            }
         }
     }
 }
-
 
 # Summary
 Write-Output ''
@@ -710,19 +622,21 @@ if ($failedAuths.Count -gt 0) {
     $exitCode = 1
 }
 
-
 # Display updated authentication list
 if ($exitCode -eq 0 -and $addedAuths.Count -gt 0) {
-    try {
-        Write-Log 'INFO' 'Retrieving updated authentication methods...'
-        $authMethods = Invoke-CyberArkRest -Uri $getAuthUrl -Method Get -Headers $headers
+    Write-Log 'INFO' 'Retrieving updated authentication methods...'
 
-        if ($authMethods.authentication) {
+    try {
+        $authMethods = Get-PASApplicationAuthenticationMethod -AppID $AppID
+
+        if ($authMethods) {
+            $authMethods = @($authMethods)
+
             Write-Output ''
-            Write-Log 'INFO' ("Application '{0}' now has {1} authentication method(s):" -f $AppID, $authMethods.authentication.Count)
+            Write-Log 'INFO' ("Application '{0}' now has {1} authentication method(s):" -f $AppID, $authMethods.Count)
             Write-Output ('=' * 80)
 
-            foreach ($auth in $authMethods.authentication) {
+            foreach ($auth in $authMethods) {
                 Write-Output ("  - Auth ID: {0} | Type: {1}" -f $auth.authID, $auth.AuthType)
 
                 if ($auth.AuthValue) {
@@ -752,28 +666,23 @@ if ($exitCode -eq 0 -and $addedAuths.Count -gt 0) {
         }
     } catch {
         Write-Log 'WARN' ("Could not retrieve updated authentication methods: {0}" -f $_.Exception.Message)
-        if ($_.ErrorDetails.Message) {
-            Write-Log 'WARN' ("API Error Details: {0}" -f $_.ErrorDetails.Message)
-        }
     }
 }
 
-
 # Logoff if we created the session
-if ($shouldLogoff -and -not [string]::IsNullOrWhiteSpace($sessionToken)) {
+if ($shouldLogoff) {
     try {
         Write-Log 'INFO' 'Logging off...'
-        $logoffUrl = "{0}/API/Auth/Logoff" -f $PVWAUrl
-        $null = Invoke-CyberArkRest -Uri $logoffUrl -Method Post -Headers @{ Authorization = (Normalize-HeaderValue -Value $sessionToken) }
+        Close-PASSession
         Write-Log 'INFO' 'Session closed successfully.'
     } catch {
         Write-Log 'WARN' ("Could not close session properly: {0}" -f $_.Exception.Message)
     }
 } else {
-    Write-Log 'INFO' 'Session token was provided. Not logging off.'
+    Write-Log 'INFO' 'psPAS session was provided. Not logging off.'
 }
 
 # Clear sensitive variable reference
-$plainPassword = $null
+$Credential = $null
 
 exit $exitCode
