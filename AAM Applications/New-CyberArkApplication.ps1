@@ -55,7 +55,7 @@
     OTP for RADIUS authentication.
 
 .PARAMETER LogonToken
-    Existing psPAS session object from Get-PASSession / New-PASSession.
+    Existing psPAS session object from Get-PASSession.
     If provided, the script will reuse it and will NOT log off.
 
 .EXAMPLE
@@ -120,14 +120,14 @@ param(
     [Parameter(Mandatory = $false)]
     [PSCredential]$Credential,
 
-    [Parameter(Mandatory = $false, HelpMessage = 'Enter the Authentication type (Default: cyberark)')]
+    [Parameter(Mandatory = $false)]
     [ValidateSet('cyberark', 'ldap', 'radius')]
     [string]$AuthenticationType = 'cyberark',
 
-    [Parameter(Mandatory = $false, HelpMessage = 'Enter the RADIUS OTP')]
+    [Parameter(Mandatory = $false)]
     [string]$OTP,
 
-    [Parameter(Mandatory = $false, HelpMessage = 'Pass an existing psPAS session object. If passed the session is NOT logged off')]
+    [Parameter(Mandatory = $false)]
     [Alias('session', 'sessionToken')]
     [object]$LogonToken
 )
@@ -138,25 +138,29 @@ function Write-Log {
         [string]$Message
     )
 
+    # Simple script-friendly logging
     Write-Output ("{0} {1}" -f $Level.ToUpper().PadRight(5), $Message)
 }
 
 $exitCode = 0
 $shouldLogoff = $true
 $parsedExpirationDate = $null
-$targetLocation = $null
+$targetLocation = '\'
 
+# Normalize string inputs once at the start
 $PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
 $AppID = $AppID.Trim()
 
 if (-not [string]::IsNullOrWhiteSpace($Location)) {
     $Location = $Location.Trim()
+    $targetLocation = $Location
 }
 
 if (-not [string]::IsNullOrWhiteSpace($OTP)) {
     $OTP = $OTP.Trim()
 }
 
+# Basic validation
 if ([string]::IsNullOrWhiteSpace($AppID)) {
     Write-Log 'ERROR' 'AppID cannot be blank.'
     exit 1
@@ -167,11 +171,13 @@ if ([string]::IsNullOrWhiteSpace($PVWAUrl)) {
     exit 1
 }
 
+# RADIUS requires OTP
 if ($AuthenticationType -eq 'radius' -and [string]::IsNullOrWhiteSpace($OTP)) {
     Write-Log 'ERROR' 'OTP is required when AuthenticationType is radius.'
     exit 1
 }
 
+# Validate ExpirationDate if supplied
 if (-not [string]::IsNullOrWhiteSpace($ExpirationDate)) {
     if (-not [datetime]::TryParseExact($ExpirationDate, 'MM-dd-yyyy', $null, [System.Globalization.DateTimeStyles]::None, [ref]$parsedExpirationDate)) {
         Write-Log 'ERROR' 'ExpirationDate must be in MM-dd-yyyy format.'
@@ -179,29 +185,23 @@ if (-not [string]::IsNullOrWhiteSpace($ExpirationDate)) {
     }
 }
 
-$targetLocation = '\'
-if (-not [string]::IsNullOrWhiteSpace($Location)) {
-    $targetLocation = $Location
-}
-
+# Confirm psPAS is available before doing anything else
 if (-not (Get-Module -ListAvailable -Name psPAS)) {
     Write-Log 'ERROR' 'psPAS module is not installed or not available.'
     exit 1
 }
 
+# Import psPAS into the current session
 Import-Module psPAS -ErrorAction Stop
 
 try {
+    # Reuse an existing psPAS session if supplied
     if ($null -ne $LogonToken) {
-        if ($LogonToken -is [string]) {
-            Write-Log 'ERROR' 'For psPAS, LogonToken must be a psPAS session object from Get-PASSession, not a raw token string.'
-            exit 1
-        }
-
         Use-PASSession -Session $LogonToken
         $shouldLogoff = $false
         Write-Log 'INFO' 'Using provided psPAS session. Script will not log off.'
     } else {
+        # Prompt for credentials if not provided
         if (-not $Credential) {
             $Credential = Get-Credential -Message 'Enter CyberArk credentials'
         }
@@ -213,6 +213,7 @@ try {
 
         Write-Log 'INFO' ("Authenticating with psPAS using {0}..." -f $AuthenticationType)
 
+        # Build New-PASSession parameters
         $sessionParams = @{
             BaseURI          = $PVWAUrl
             Credential       = $Credential
@@ -220,40 +221,37 @@ try {
             SkipVersionCheck = $true
         }
 
+        # Optional certificate validation bypass
         if ($DisableCertificateValidation) {
             $sessionParams['SkipCertificateCheck'] = $true
         }
 
-        if ($AuthenticationType -eq 'radius' -and -not [string]::IsNullOrWhiteSpace($OTP)) {
+        # Add OTP only for RADIUS
+        if ($AuthenticationType -eq 'radius') {
             $sessionParams['OTP'] = $OTP
         }
 
+        # Create a new psPAS session
         $null = New-PASSession @sessionParams
         Write-Log 'INFO' 'Authentication successful.'
     }
 
+    # Check whether application already exists
     Write-Log 'INFO' ("Checking if application '{0}' already exists..." -f $AppID)
 
     $existingApp = $null
     try {
-        $existingApp = Get-PASApplication -Search $AppID
+        $existingApp = Get-PASApplication $AppID -ExactMatch
     } catch {
         $existingApp = $null
     }
 
-    $appExists = $false
     if ($existingApp) {
-        $matchingApps = @($existingApp | Where-Object { $_.AppID -eq $AppID })
-        if ($matchingApps.Count -gt 0) {
-            $appExists = $true
-        }
-    }
-
-    if ($appExists) {
         Write-Log 'ERROR' ("Application '{0}' already exists. Use a different name or delete the existing application first." -f $AppID)
         $exitCode = 1
     }
 
+    # Prepare and create the application
     if ($exitCode -eq 0) {
         $addParams = @{
             AppID    = $AppID
@@ -261,6 +259,7 @@ try {
             Disabled = $Disabled
         }
 
+        # Add optional properties only when supplied
         if (-not [string]::IsNullOrWhiteSpace($Description)) { $addParams['Description'] = $Description.Trim() }
         if ($PSBoundParameters.ContainsKey('AccessPermittedFrom')) { $addParams['AccessPermittedFrom'] = $AccessPermittedFrom }
         if ($PSBoundParameters.ContainsKey('AccessPermittedTo')) { $addParams['AccessPermittedTo'] = $AccessPermittedTo }
@@ -274,10 +273,11 @@ try {
         $null = Add-PASApplication @addParams
         Write-Log 'INFO' ("Application '{0}' created successfully." -f $AppID)
 
+        # Verify the application was created
         Write-Log 'INFO' 'Verifying application was created...'
-        $verifiedApp = $null
-        $verifiedApp = Get-PASApplication -Search $AppID | Where-Object { $_.AppID -eq $AppID } | Select-Object -First 1
+        $verifiedApp = Get-PASApplication $AppID -ExactMatch
 
+        # Display the application details
         if ($null -ne $verifiedApp) {
             Write-Output ''
             Write-Output 'Application Details:'
@@ -324,6 +324,7 @@ try {
     Write-Output ''
     Write-Log 'ERROR' ("Error occurred: {0}" -f $_.Exception.Message)
 } finally {
+    # Log off only if this script created the session
     if ($shouldLogoff) {
         try {
             Write-Log 'INFO' 'Logging off...'
@@ -336,6 +337,7 @@ try {
         Write-Log 'INFO' 'psPAS session was provided. Not logging off.'
     }
 
+    # Clear sensitive references
     $Credential = $null
 
     exit $exitCode
