@@ -1,34 +1,42 @@
 <#
 .SYNOPSIS
-    Adds a new application to CyberArk using psPAS.
+    Adds a new application to CyberArk using psPAS, with support for CCP and CP application types.
 
 .DESCRIPTION
     This script authenticates with psPAS and creates a new application in the Vault.
 
+    ApplicationType behaviour:
+      AddCCP  - Prefixes AppID with 'cp_ccp_', sets Location to \CCPApplications, no expiry.
+                No vault account is onboarded.
+      AddCP   - Prefixes AppID with 'cs_cp_', sets Location to \CPApplications, no expiry.
+                A vault account is onboarded into the safe specified by -SafeName, using a
+                randomly generated 25-character password (alphanumeric with '-' separators).
+
 .PARAMETER PVWAUrl
-    The base URL of the CyberArk PVWA (e.g. https://pvwa.company.com or https://pvwa.company.com/PasswordVault)
+    The base URL of the CyberArk PVWA (e.g. https://pvwa.company.com/PasswordVault)
 
 .PARAMETER Credential
     PSCredential object for CyberArk authentication. If not provided, will prompt.
 
+.PARAMETER ApplicationType
+    Required. Either 'AddCCP' or 'AddCP'. Controls the prefix, location, and whether a
+    vault account is onboarded.
+
 .PARAMETER AppID
-    The application name (required).
+    The application name without prefix (required). The appropriate prefix is prepended
+    automatically based on ApplicationType.
 
 .PARAMETER Description
     Optional description of the application.
 
-.PARAMETER Location
-    Optional location of the application in the Vault hierarchy.
-    If not supplied, "\" will be used.
+.PARAMETER SafeName
+    Required when ApplicationType is AddCP. The safe into which the vault account is onboarded.
 
 .PARAMETER AccessPermittedFrom
     Optional start hour that access is permitted (0-23).
 
 .PARAMETER AccessPermittedTo
     Optional end hour that access is permitted (0-23).
-
-.PARAMETER ExpirationDate
-    Optional expiration date of the application in mm-dd-yyyy format.
 
 .PARAMETER Disabled
     Optional flag to create the application as disabled. Default is $false.
@@ -62,13 +70,15 @@
     $cred = Get-Credential
     .\New-CyberArkApplication.ps1 -PVWAUrl "https://pvwa.company.com/PasswordVault" `
         -Credential $cred `
+        -ApplicationType AddCCP `
         -AppID "MyNewApp" `
-        -Description "My application for testing" `
-        -Location "\Applications"
+        -Description "My CCP application"
 
 .EXAMPLE
     .\New-CyberArkApplication.ps1 -PVWAUrl "https://pvwa.company.com/PasswordVault" `
+        -ApplicationType AddCP `
         -AppID "MyNewApp" `
+        -SafeName "CP_Applications_Safe" `
         -BusinessOwnerFName "John" `
         -BusinessOwnerLName "Doe" `
         -BusinessOwnerEmail "john.doe@company.com"
@@ -77,13 +87,17 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
+    [ValidateSet('AddCCP', 'AddCP')]
+    [string]$ApplicationType,
+
+    [Parameter(Mandatory = $true)]
     [string]$AppID,
 
     [Parameter(Mandatory = $false)]
     [string]$Description,
 
     [Parameter(Mandatory = $false)]
-    [string]$Location,
+    [string]$SafeName,
 
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 23)]
@@ -92,9 +106,6 @@ param(
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 23)]
     [int]$AccessPermittedTo,
-
-    [Parameter(Mandatory = $false)]
-    [string]$ExpirationDate,
 
     [Parameter(Mandatory = $false)]
     [bool]$Disabled = $false,
@@ -132,37 +143,92 @@ param(
     [object]$LogonToken
 )
 
+#region --- Helper Functions ---
+
 function Write-Log {
     param(
         [string]$Level,
         [string]$Message
     )
-
-    # Simple script-friendly logging
     Write-Output ("{0} {1}" -f $Level.ToUpper().PadRight(5), $Message)
 }
 
-$exitCode = 0
-$shouldLogoff = $true
-$parsedExpirationDate = $null
-$targetLocation = '\'
-$existingApp = $null
-$verifiedApp = $null
+function New-RandomPassword {
+    <#
+    .SYNOPSIS
+        Generates a 25-character random password of alphanumeric characters with a '-'
+        separator inserted after every 5th or 6th character (alternating), producing a
+        grouped format such as: aBcD3-xYz12-mNpQ7-rStU4-vW9
 
-# Normalize string inputs once at the start
-$PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
-$AppID = $AppID.Trim()
+    .OUTPUTS
+        [string] The generated password.
+    #>
 
-if (-not [string]::IsNullOrWhiteSpace($Location)) {
-    $Location = $Location.Trim()
-    $targetLocation = $Location
+    $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    $rng   = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+
+    # Build 25 cryptographically random alphanumeric characters
+    $rawChars = [System.Text.StringBuilder]::new(25)
+    $singleByte = [byte[]]::new(1)
+
+    while ($rawChars.Length -lt 25) {
+        $rng.GetBytes($singleByte)
+        # Rejection sampling: discard values that would create modulo bias
+        $index = $singleByte[0] % $chars.Length
+        if ($singleByte[0] -lt (256 - (256 % $chars.Length))) {
+            $null = $rawChars.Append($chars[$index])
+        }
+    }
+
+    $rng.Dispose()
+
+    # Insert '-' separators: groups of 5, 6, 5, 6, 3 = 25 chars -> "XXXXX-XXXXXX-XXXXX-XXXXXX-XXX"
+    # Pattern alternates 5/6 to produce a natural-looking grouped password
+    $groupSizes = @(5, 6, 5, 6, 3)
+    $password   = [System.Text.StringBuilder]::new(30)
+    $pos        = 0
+
+    for ($i = 0; $i -lt $groupSizes.Length; $i++) {
+        if ($i -gt 0) { $null = $password.Append('-') }
+        $null = $password.Append($rawChars.ToString().Substring($pos, $groupSizes[$i]))
+        $pos += $groupSizes[$i]
+    }
+
+    return $password.ToString()
 }
+
+#endregion
+
+#region --- Type-Driven Configuration ---
+
+switch ($ApplicationType) {
+    'AddCCP' {
+        $appPrefix      = 'cp_ccp_'
+        $targetLocation = '\CCPApplications'
+        $onboardAccount = $false
+    }
+    'AddCP' {
+        $appPrefix      = 'cs_cp_'
+        $targetLocation = '\CPApplications'
+        $onboardAccount = $true
+    }
+}
+
+#endregion
+
+#region --- Pre-flight Validation ---
+
+$exitCode    = 0
+$shouldLogoff = $true
+
+# Normalize string inputs
+$PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
+$AppID   = $AppID.Trim()
 
 if (-not [string]::IsNullOrWhiteSpace($OTP)) {
     $OTP = $OTP.Trim()
 }
 
-# Basic validation
 if ([string]::IsNullOrWhiteSpace($AppID)) {
     Write-Log 'ERROR' 'AppID cannot be blank.'
     exit 1
@@ -173,30 +239,41 @@ if ([string]::IsNullOrWhiteSpace($PVWAUrl)) {
     exit 1
 }
 
-# RADIUS requires OTP
+# AddCP requires a SafeName for account onboarding
+if ($onboardAccount -and [string]::IsNullOrWhiteSpace($SafeName)) {
+    Write-Log 'ERROR' 'SafeName is required when ApplicationType is AddCP.'
+    exit 1
+}
+
 if ($AuthenticationType -eq 'radius' -and [string]::IsNullOrWhiteSpace($OTP)) {
     Write-Log 'ERROR' 'OTP is required when AuthenticationType is radius.'
     exit 1
 }
 
-# Validate ExpirationDate if supplied
-if (-not [string]::IsNullOrWhiteSpace($ExpirationDate)) {
-    if (-not [datetime]::TryParseExact($ExpirationDate, 'MM-dd-yyyy', $null, [System.Globalization.DateTimeStyles]::None, [ref]$parsedExpirationDate)) {
-        Write-Log 'ERROR' 'ExpirationDate must be in MM-dd-yyyy format.'
-        exit 1
-    }
-}
+# Build the full prefixed AppID
+# Strip any accidental prefix duplication if the caller included it
+$cleanAppID = $AppID -replace "^$([regex]::Escape($appPrefix))", ''
+$fullAppID  = '{0}{1}' -f $appPrefix, $cleanAppID
 
-# Confirm psPAS is available before doing anything else
+Write-Log 'INFO' ("ApplicationType : {0}" -f $ApplicationType)
+Write-Log 'INFO' ("Resolved AppID  : {0}" -f $fullAppID)
+Write-Log 'INFO' ("Location        : {0}" -f $targetLocation)
+
+#endregion
+
+#region --- Module Check ---
+
 if (-not (Get-Module -ListAvailable -Name psPAS)) {
     Write-Log 'ERROR' 'psPAS module is not installed or not available.'
     exit 1
 }
 
-# Import psPAS into the current session
 Import-Module psPAS -ErrorAction Stop
 
-# Reuse an existing psPAS session if supplied
+#endregion
+
+#region --- Authentication ---
+
 if ($null -ne $LogonToken) {
     try {
         Use-PASSession -Session $LogonToken
@@ -207,7 +284,6 @@ if ($null -ne $LogonToken) {
         exit 1
     }
 } else {
-    # Prompt for credentials if not provided
     if (-not $Credential) {
         $Credential = Get-Credential -Message 'Enter CyberArk credentials'
     }
@@ -219,7 +295,6 @@ if ($null -ne $LogonToken) {
 
     Write-Log 'INFO' ("Authenticating with psPAS using {0}..." -f $AuthenticationType)
 
-    # Build New-PASSession parameters
     $sessionParams = @{
         BaseURI          = $PVWAUrl
         Credential       = $Credential
@@ -227,17 +302,9 @@ if ($null -ne $LogonToken) {
         SkipVersionCheck = $true
     }
 
-    # Optional certificate validation bypass
-    if ($DisableCertificateValidation) {
-        $sessionParams['SkipCertificateCheck'] = $true
-    }
+    if ($DisableCertificateValidation) { $sessionParams['SkipCertificateCheck'] = $true }
+    if ($AuthenticationType -eq 'radius') { $sessionParams['OTP'] = $OTP }
 
-    # Add OTP only for RADIUS
-    if ($AuthenticationType -eq 'radius') {
-        $sessionParams['OTP'] = $OTP
-    }
-
-    # Create a new psPAS session
     try {
         $null = New-PASSession @sessionParams
         Write-Log 'INFO' 'Authentication successful.'
@@ -247,102 +314,161 @@ if ($null -ne $LogonToken) {
     }
 }
 
-# Check whether application already exists
-Write-Log 'INFO' ("Checking if application '{0}' already exists..." -f $AppID)
+#endregion
 
+#region --- Duplicate Check ---
+
+Write-Log 'INFO' ("Checking if application '{0}' already exists..." -f $fullAppID)
+
+$existingApp = $null
 try {
-    $existingApp = Get-PASApplication -AppID $AppID -ExactMatch
+    $existingApp = Get-PASApplication -AppID $fullAppID -ExactMatch
 } catch {
     $existingApp = $null
 }
 
 if ($existingApp) {
-    Write-Log 'ERROR' ("Application '{0}' already exists. Use a different name or delete the existing application first." -f $AppID)
+    Write-Log 'ERROR' ("Application '{0}' already exists. Use a different name or delete the existing application first." -f $fullAppID)
     $exitCode = 1
 }
 
-# Prepare and create the application
+#endregion
+
+#region --- Create Application ---
+
 if ($exitCode -eq 0) {
     $addParams = @{
-        AppID    = $AppID
+        AppID    = $fullAppID
         Location = $targetLocation
         Disabled = $Disabled
+        # ExpirationDate is intentionally omitted so the application never expires
     }
 
-    # Add optional properties only when supplied
-    if (-not [string]::IsNullOrWhiteSpace($Description)) { $addParams['Description'] = $Description.Trim() }
-    if ($PSBoundParameters.ContainsKey('AccessPermittedFrom')) { $addParams['AccessPermittedFrom'] = $AccessPermittedFrom }
-    if ($PSBoundParameters.ContainsKey('AccessPermittedTo')) { $addParams['AccessPermittedTo'] = $AccessPermittedTo }
-    if ($null -ne $parsedExpirationDate) { $addParams['ExpirationDate'] = $parsedExpirationDate }
-    if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerFName)) { $addParams['BusinessOwnerFName'] = $BusinessOwnerFName.Trim() }
-    if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerLName)) { $addParams['BusinessOwnerLName'] = $BusinessOwnerLName.Trim() }
-    if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerEmail)) { $addParams['BusinessOwnerEmail'] = $BusinessOwnerEmail.Trim() }
-    if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerPhone)) { $addParams['BusinessOwnerPhone'] = $BusinessOwnerPhone.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($Description))        { $addParams['Description']        = $Description.Trim() }
+    if ($PSBoundParameters.ContainsKey('AccessPermittedFrom'))  { $addParams['AccessPermittedFrom'] = $AccessPermittedFrom }
+    if ($PSBoundParameters.ContainsKey('AccessPermittedTo'))    { $addParams['AccessPermittedTo']   = $AccessPermittedTo }
+    if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerFName)) { $addParams['BusinessOwnerFName']  = $BusinessOwnerFName.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerLName)) { $addParams['BusinessOwnerLName']  = $BusinessOwnerLName.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerEmail)) { $addParams['BusinessOwnerEmail']  = $BusinessOwnerEmail.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($BusinessOwnerPhone)) { $addParams['BusinessOwnerPhone']  = $BusinessOwnerPhone.Trim() }
 
-    Write-Log 'INFO' ("Creating application '{0}'..." -f $AppID)
+    Write-Log 'INFO' ("Creating application '{0}'..." -f $fullAppID)
 
     try {
         $null = Add-PASApplication @addParams
-        Write-Log 'INFO' ("Application '{0}' created successfully." -f $AppID)
+        Write-Log 'INFO' ("Application '{0}' created successfully." -f $fullAppID)
     } catch {
-        Write-Log 'ERROR' ("Could not create application '{0}': {1}" -f $AppID, $_.Exception.Message)
+        Write-Log 'ERROR' ("Could not create application '{0}': {1}" -f $fullAppID, $_.Exception.Message)
         $exitCode = 1
     }
 }
 
-# Verify the application was created
+#endregion
+
+#region --- Onboard Vault Account (AddCP only) ---
+
+$generatedPassword = $null
+
+if ($exitCode -eq 0 -and $onboardAccount) {
+    Write-Log 'INFO' ("Generating vault account password for '{0}'..." -f $fullAppID)
+
+    $generatedPassword = New-RandomPassword
+
+    # Convert to SecureString for Add-PASAccount
+    $securePassword = ConvertTo-SecureString -String $generatedPassword -AsPlainText -Force
+
+    Write-Log 'INFO' ("Onboarding vault account for '{0}' into safe '{1}'..." -f $fullAppID, $SafeName.Trim())
+
+    $accountParams = @{
+        SafeName               = $SafeName.Trim()
+        PlatformID             = 'WinLocalAdministrator'   # adjust to your target platform
+        Address                = 'localhost'                # adjust to your target address
+        Username               = $fullAppID
+        Secret                 = $securePassword
+        SecretType             = 'Password'
+        # platformAccountProperties can carry PasswordNeverExpires if your platform supports it
+        platformAccountProperties = @{
+            PasswordNeverExpires = 'True'
+        }
+    }
+
+    # Use the friendly account name so it is identifiable in the safe
+    $accountParams['Name'] = $fullAppID
+
+    try {
+        $newAccount = Add-PASAccount @accountParams
+        Write-Log 'INFO' ("Vault account '{0}' onboarded successfully (AccountID: {1})." -f $fullAppID, $newAccount.id)
+    } catch {
+        Write-Log 'ERROR' ("Could not onboard vault account for '{0}': {1}" -f $fullAppID, $_.Exception.Message)
+        $exitCode = 1
+    }
+
+    # Scrub the SecureString from memory
+    $securePassword.Dispose()
+}
+
+#endregion
+
+#region --- Verification Display ---
+
 if ($exitCode -eq 0) {
     Write-Log 'INFO' 'Verifying application was created...'
 
+    $verifiedApp = $null
     try {
-        $verifiedApp = Get-PASApplication -AppID $AppID -ExactMatch
+        $verifiedApp = Get-PASApplication -AppID $fullAppID -ExactMatch
     } catch {
         $verifiedApp = $null
-        Write-Log 'WARN' ("Application '{0}' was created but could not be re-read for display: {1}" -f $AppID, $_.Exception.Message)
+        Write-Log 'WARN' ("Application '{0}' was created but could not be re-read for display: {1}" -f $fullAppID, $_.Exception.Message)
     }
 
-    # Display the application details
     if ($null -ne $verifiedApp) {
         Write-Output ''
         Write-Output 'Application Details:'
         Write-Output ('=' * 80)
-        Write-Output ("  AppID: {0}" -f $verifiedApp.AppID)
+        Write-Output ("  AppID            : {0}" -f $verifiedApp.AppID)
+        Write-Output ("  ApplicationType  : {0}" -f $ApplicationType)
 
         if ($verifiedApp.Description) {
-            Write-Output ("  Description: {0}" -f $verifiedApp.Description)
+            Write-Output ("  Description      : {0}" -f $verifiedApp.Description)
         }
 
         if ($verifiedApp.Location) {
-            Write-Output ("  Location: {0}" -f $verifiedApp.Location)
+            Write-Output ("  Location         : {0}" -f $verifiedApp.Location)
         }
 
-        Write-Output ("  Disabled: {0}" -f $verifiedApp.Disabled)
+        Write-Output ("  Disabled         : {0}" -f $verifiedApp.Disabled)
+        Write-Output ("  Expiration       : Never")
 
         if ($null -ne $verifiedApp.AccessPermittedFrom -or $null -ne $verifiedApp.AccessPermittedTo) {
-            Write-Output ("  Access Hours: {0} - {1}" -f $verifiedApp.AccessPermittedFrom, $verifiedApp.AccessPermittedTo)
-        }
-
-        if ($verifiedApp.ExpirationDate) {
-            Write-Output ("  Expiration Date: {0}" -f $verifiedApp.ExpirationDate)
+            Write-Output ("  Access Hours     : {0} - {1}" -f $verifiedApp.AccessPermittedFrom, $verifiedApp.AccessPermittedTo)
         }
 
         if ($verifiedApp.BusinessOwnerFName -or $verifiedApp.BusinessOwnerLName) {
-            Write-Output ("  Business Owner: {0} {1}" -f $verifiedApp.BusinessOwnerFName, $verifiedApp.BusinessOwnerLName)
+            Write-Output ("  Business Owner   : {0} {1}" -f $verifiedApp.BusinessOwnerFName, $verifiedApp.BusinessOwnerLName)
         }
 
         if ($verifiedApp.BusinessOwnerEmail) {
-            Write-Output ("  Business Owner Email: {0}" -f $verifiedApp.BusinessOwnerEmail)
+            Write-Output ("  Business Owner   : {0}" -f $verifiedApp.BusinessOwnerEmail)
         }
 
         if ($verifiedApp.BusinessOwnerPhone) {
-            Write-Output ("  Business Owner Phone: {0}" -f $verifiedApp.BusinessOwnerPhone)
+            Write-Output ("  Business Owner   : {0}" -f $verifiedApp.BusinessOwnerPhone)
+        }
+
+        if ($onboardAccount) {
+            Write-Output ("  Vault Account    : {0} (onboarded into safe: {1})" -f $fullAppID, $SafeName.Trim())
+            Write-Output ("  Password Expires : Never")
         }
 
         Write-Output ('=' * 80)
     }
 }
 
-# Log off only if this script created the session
+#endregion
+
+#region --- Session Cleanup ---
+
 if ($shouldLogoff) {
     try {
         Write-Log 'INFO' 'Logging off...'
@@ -355,7 +481,8 @@ if ($shouldLogoff) {
     Write-Log 'INFO' 'psPAS session was provided. Not logging off.'
 }
 
-# Clear sensitive references
-$Credential = $null
+# Scrub sensitive references
+$Credential        = $null
+$generatedPassword = $null
 
 exit $exitCode
