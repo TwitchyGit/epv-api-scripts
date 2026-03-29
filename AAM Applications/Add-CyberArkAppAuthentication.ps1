@@ -1,62 +1,103 @@
 <#
 .SYNOPSIS
-    Adds one or more authentication methods to a CyberArk Application.
+    Adds or replaces authentication methods on a CyberArk Application.
 
 .DESCRIPTION
-    This script authenticates to CyberArk and adds authentication methods to a specified application.
-    You can add multiple authentication types in a single call by specifying multiple parameters.
+    This script authenticates to CyberArk and adds or replaces authentication methods
+    on a specified application.
 
-    If no authentication methods are specified, the script will only verify that the application exists.
+    By default, supplied values are ADDED to any existing entries of the same type.
+    Duplicates are detected and skipped automatically.
+
+    To replace ALL existing entries of a given type with the newly supplied values,
+    pass the corresponding -Replace<Type> switch. The script will delete every existing
+    entry of that type and then add the new values fresh.
+
+    If no authentication methods are specified the script runs in verify-only mode and
+    confirms that the application exists.
 
     Supported authentication types:
-    - Path: File or folder path (use -Path parameter)
-    - Hash: File hash (use -Hash parameter)
-    - OS User: Windows user account (use -OSUser parameter)
-    - Machine Address: IP address or subnet (use -MachineAddress parameter)
-    - Certificate Serial Number: Certificate serial number (use -CertificateSerialNumber parameter)
-    - Certificate Attributes: Certificate subject/issuer (use -CertificateIssuer, -CertificateSubject, -CertificateSubjectAlternativeName)
+      Path                  -Path               (optionally -ReplacePath)
+      Hash                  -Hash               (optionally -ReplaceHash)
+      OS User               -OSUser             (optionally -ReplaceOSUser)
+      Machine Address       -MachineAddress     (optionally -ReplaceMachineAddress)
+      Certificate Serial    -CertificateSerialNumber  (optionally -ReplaceCertificateSerialNumber)
+      Certificate Attributes  -CertificateIssuer / -CertificateSubject /
+                              -CertificateSubjectAlternativeName
+                                                (optionally -ReplaceCertificateAttr)
 
 .PARAMETER AppID
-    The Application ID to which authentication methods will be added
+    The Application ID to which authentication methods will be added or replaced.
 
 .PARAMETER Path
-    Path to executable or folder for Path authentication. Can provide multiple paths as an array.
+    Path to executable or folder for Path authentication. Accepts multiple values.
+
+.PARAMETER ReplacePath
+    When set, ALL existing Path authentication entries are deleted before the new values
+    in -Path are added.
 
 .PARAMETER PathIsFolder
-    For Path authentication - whether the path is a folder. Default: $false
+    For Path authentication — whether the path is a folder. Default: $false.
 
 .PARAMETER PathAllowInternalScripts
-    For Path authentication - whether to allow internal scripts. Default: $false
+    For Path authentication — whether to allow internal scripts. Default: $false.
 
 .PARAMETER Hash
-    File hash value for Hash authentication. Can provide multiple hashes as an array.
+    File hash value(s) for Hash authentication. Accepts multiple values.
+
+.PARAMETER ReplaceHash
+    When set, ALL existing Hash authentication entries are deleted before the new values
+    in -Hash are added.
 
 .PARAMETER HashComment
-    Optional comment for Hash authentication
+    Optional comment applied to every Hash entry being added.
 
 .PARAMETER OSUser
-    Windows user account (e.g. "DOMAIN\User") for OS User authentication. Can provide multiple as an array.
+    Windows user account(s) (e.g. "DOMAIN\User") for OS User authentication.
+    Accepts multiple values.
+
+.PARAMETER ReplaceOSUser
+    When set, ALL existing OSUser authentication entries are deleted before the new
+    values in -OSUser are added.
 
 .PARAMETER MachineAddress
-    IP address or subnet (e.g. "192.168.1.100" or "192.168.1.0/24") for Machine Address authentication. Can provide multiple as an array.
+    IP address or subnet(s) (e.g. "192.168.1.100" or "192.168.1.0/24") for Machine
+    Address authentication. Accepts multiple values.
+
+.PARAMETER ReplaceMachineAddress
+    When set, ALL existing MachineAddress authentication entries are deleted before the
+    new values in -MachineAddress are added.
 
 .PARAMETER CertificateSerialNumber
-    Certificate serial number for Certificate Serial Number authentication. Can provide multiple as an array.
+    Certificate serial number(s) for Certificate Serial Number authentication.
+    Accepts multiple values.
+
+.PARAMETER ReplaceCertificateSerialNumber
+    When set, ALL existing CertificateSerialNumber authentication entries are deleted
+    before the new values in -CertificateSerialNumber are added.
 
 .PARAMETER CertificateSerialNumberComment
-    Optional comment for Certificate Serial Number authentication
+    Optional comment applied to every CertificateSerialNumber entry being added.
 
 .PARAMETER CertificateIssuer
-    Array of certificate issuer attributes (e.g. @("CN=Company CA","OU=IT")) for Certificate Attributes authentication
+    Certificate issuer attribute(s) (e.g. @("CN=Company CA","OU=IT")) for Certificate
+    Attributes authentication.
 
 .PARAMETER CertificateSubject
-    Array of certificate subject attributes (e.g. @("CN=app.company.com","OU=IT")) for Certificate Attributes authentication
+    Certificate subject attribute(s) (e.g. @("CN=app.company.com","OU=IT")) for
+    Certificate Attributes authentication.
 
 .PARAMETER CertificateSubjectAlternativeName
-    Array of certificate SAN attributes (e.g. @("DNS Name=www.example.com")) for Certificate Attributes authentication
+    Certificate SAN attribute(s) (e.g. @("DNS Name=www.example.com")) for Certificate
+    Attributes authentication.
+
+.PARAMETER ReplaceCertificateAttr
+    When set, ALL existing CertificateAttr authentication entries are deleted before the
+    new values in -CertificateIssuer/-CertificateSubject/-CertificateSubjectAlternativeName
+    are added.
 
 .PARAMETER PVWAUrl
-    The base URL of the CyberArk PVWA (e.g. https://pvwa.company.com)
+    The base URL of the CyberArk PVWA (e.g. https://pvwa.company.com).
 
 .PARAMETER Credential
     PSCredential object for CyberArk authentication. If not provided, will prompt.
@@ -64,31 +105,38 @@
 .PARAMETER DisableCertificateValidation
     Disables SSL certificate validation. Use only for testing with self-signed certificates.
 
-.EXAMPLE
-    .\Add-CyberArkAppAuthentication.ps1 -AppID "MyApp" -PVWAUrl "https://pvwa.company.com" -Path "C:\Program Files\MyApp\app.exe"
+.PARAMETER AuthenticationType
+    Authentication type for New-PASSession: cyberark, ldap, or radius. Default: cyberark.
+
+.PARAMETER OTP
+    OTP for RADIUS authentication.
+
+.PARAMETER LogonToken
+    Existing psPAS session object from Get-PASSession.
+    If provided, the script will reuse it and will NOT log off.
 
 .EXAMPLE
+    # Add a single Path entry
     .\Add-CyberArkAppAuthentication.ps1 -AppID "MyApp" -PVWAUrl "https://pvwa.company.com" `
-        -Path "C:\Program Files\MyApp\app.exe" `
-        -OSUser "DOMAIN\ServiceAccount" `
-        -MachineAddress "192.168.1.0/24"
+        -Path "C:\Program Files\MyApp\app.exe"
 
 .EXAMPLE
+    # Replace ALL existing Path entries with two new ones
     .\Add-CyberArkAppAuthentication.ps1 -AppID "MyApp" -PVWAUrl "https://pvwa.company.com" `
-        -Path @("C:\App\app1.exe", "C:\App\app2.exe")
+        -Path @("C:\App\v2\app.exe","C:\App\v2\helper.exe") -ReplacePath
 
 .EXAMPLE
+    # Replace all existing MachineAddress entries and add new OSUser entries alongside
+    .\Add-CyberArkAppAuthentication.ps1 -AppID "MyApp" -PVWAUrl "https://pvwa.company.com" `
+        -MachineAddress "10.0.0.0/8" -ReplaceMachineAddress `
+        -OSUser "DOMAIN\svc_newaccount"
+
+.EXAMPLE
+    # Replace all Certificate Attribute entries
     .\Add-CyberArkAppAuthentication.ps1 -AppID "MyApp" -PVWAUrl "https://pvwa.company.com" `
         -CertificateSubject @("CN=app.company.com","OU=IT") `
-        -CertificateIssuer @("CN=Company Root CA")
-
-.EXAMPLE
-    .\Add-CyberArkAppAuthentication.ps1 -AppID "MyApp" -PVWAUrl "https://pvwa.company.com" `
-        -Hash "A1B2C3D4E5F6" `
-        -HashComment "Production server hash"
-
-.EXAMPLE
-    .\Add-CyberArkAppAuthentication.ps1 -AppID "MyApp" -PVWAUrl "https://pvwa.company.com"
+        -CertificateIssuer @("CN=Company Root CA") `
+        -ReplaceCertificateAttr
 #>
 
 [CmdletBinding()]
@@ -96,8 +144,12 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$AppID,
 
+    # --- Path ---
     [Parameter(Mandatory = $false)]
     [string[]]$Path,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ReplacePath,
 
     [Parameter(Mandatory = $false)]
     [bool]$PathIsFolder = $false,
@@ -105,24 +157,41 @@ param(
     [Parameter(Mandatory = $false)]
     [bool]$PathAllowInternalScripts = $false,
 
+    # --- Hash ---
     [Parameter(Mandatory = $false)]
     [string[]]$Hash,
 
     [Parameter(Mandatory = $false)]
+    [switch]$ReplaceHash,
+
+    [Parameter(Mandatory = $false)]
     [string]$HashComment,
 
+    # --- OS User ---
     [Parameter(Mandatory = $false)]
     [string[]]$OSUser,
 
     [Parameter(Mandatory = $false)]
+    [switch]$ReplaceOSUser,
+
+    # --- Machine Address ---
+    [Parameter(Mandatory = $false)]
     [string[]]$MachineAddress,
 
+    [Parameter(Mandatory = $false)]
+    [switch]$ReplaceMachineAddress,
+
+    # --- Certificate Serial Number ---
     [Parameter(Mandatory = $false)]
     [string[]]$CertificateSerialNumber,
 
     [Parameter(Mandatory = $false)]
+    [switch]$ReplaceCertificateSerialNumber,
+
+    [Parameter(Mandatory = $false)]
     [string]$CertificateSerialNumberComment,
 
+    # --- Certificate Attributes ---
     [Parameter(Mandatory = $false)]
     [string[]]$CertificateIssuer,
 
@@ -133,6 +202,10 @@ param(
     [string[]]$CertificateSubjectAlternativeName,
 
     [Parameter(Mandatory = $false)]
+    [switch]$ReplaceCertificateAttr,
+
+    # --- Connection / Auth ---
+    [Parameter(Mandatory = $false)]
     [switch]$DisableCertificateValidation,
 
     [Parameter(Mandatory = $true)]
@@ -141,25 +214,25 @@ param(
     [Parameter(Mandatory = $false)]
     [PSCredential]$Credential,
 
-    [Parameter(Mandatory = $false, HelpMessage = 'Enter the Authentication type (Default: cyberark)')]
+    [Parameter(Mandatory = $false)]
     [ValidateSet('cyberark', 'ldap', 'radius')]
     [string]$AuthenticationType = 'cyberark',
 
-    [Parameter(Mandatory = $false, HelpMessage = 'Enter the RADIUS OTP')]
+    [Parameter(Mandatory = $false)]
     [string]$OTP,
 
-    [Parameter(Mandatory = $false, HelpMessage = 'Pass an existing psPAS session object. If passed the session is NOT logged off')]
+    [Parameter(Mandatory = $false)]
     [Alias('session', 'sessionToken')]
     [object]$LogonToken
 )
+
+#region --- Helper Functions ---
 
 function Write-Log {
     param(
         [string]$Level,
         [string]$Message
     )
-
-    # Simple operator-friendly logging
     Write-Output ("{0} {1}" -f $Level.ToUpper().PadRight(5), $Message)
 }
 
@@ -168,12 +241,7 @@ function Normalize-Scalar {
         [AllowNull()]
         [string]$Value
     )
-
-    # Normalize single values for duplicate comparison
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        return ''
-    }
-
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
     return $Value.Trim().ToLowerInvariant()
 }
 
@@ -182,10 +250,7 @@ function Normalize-StringArray {
         [AllowNull()]
         [string[]]$Values
     )
-
-    # Normalize, trim and sort arrays for duplicate comparison
     $output = @()
-
     if ($Values) {
         foreach ($item in $Values) {
             if (-not [string]::IsNullOrWhiteSpace($item)) {
@@ -193,7 +258,6 @@ function Normalize-StringArray {
             }
         }
     }
-
     return @($output | Sort-Object)
 }
 
@@ -201,45 +265,38 @@ function Compare-NormalizedStringArrays {
     param(
         [AllowNull()]
         [string[]]$Left,
-
         [AllowNull()]
         [string[]]$Right
     )
-
-    # Compare arrays after trim/sort/case normalization
-    $leftNorm = @(Normalize-StringArray -Values $Left)
+    $leftNorm  = @(Normalize-StringArray -Values $Left)
     $rightNorm = @(Normalize-StringArray -Values $Right)
-
-    if ($leftNorm.Count -ne $rightNorm.Count) {
-        return $false
-    }
-
+    if ($leftNorm.Count -ne $rightNorm.Count) { return $false }
     for ($i = 0; $i -lt $leftNorm.Count; $i++) {
         if ($leftNorm[$i].ToLowerInvariant() -ne $rightNorm[$i].ToLowerInvariant()) {
             return $false
         }
     }
-
     return $true
 }
 
-# Initial state
-$exitCode = 0
-$shouldLogoff = $true
-$authMethodsToAdd = @()
+#endregion
+
+#region --- Initialisation ---
+
+$exitCode           = 0
+$shouldLogoff       = $true
+$authMethodsToAdd   = @()
 $existingAuthMethods = @()
-$addedAuths = @()
-$skippedAuths = @()
-$failedAuths = @()
+$deletedAuths       = @()
+$addedAuths         = @()
+$skippedAuths       = @()
+$failedAuths        = @()
 
-# Normalize URL once at the start
 $PVWAUrl = $PVWAUrl.Trim().TrimEnd('/')
-$AppID = $AppID.Trim()
-if (-not [string]::IsNullOrWhiteSpace($OTP)) {
-    $OTP = $OTP.Trim()
-}
+$AppID   = $AppID.Trim()
 
-# Basic validation
+if (-not [string]::IsNullOrWhiteSpace($OTP)) { $OTP = $OTP.Trim() }
+
 if ([string]::IsNullOrWhiteSpace($AppID)) {
     Write-Log 'ERROR' 'AppID cannot be blank.'
     exit 1
@@ -250,30 +307,40 @@ if ([string]::IsNullOrWhiteSpace($PVWAUrl)) {
     exit 1
 }
 
-# RADIUS requires OTP
 if ($AuthenticationType -eq 'radius' -and [string]::IsNullOrWhiteSpace($OTP)) {
     Write-Log 'ERROR' 'OTP is required when AuthenticationType is radius.'
     exit 1
 }
 
-# Confirm psPAS is available before doing anything else
-if (-not (Get-Module -ListAvailable -Name psPAS)) {
-    Write-Log 'ERROR' 'psPAS module is not installed or not available.'
-    exit 1
+# Guard: -Replace<Type> supplied without its companion value parameter
+$replaceGuards = @(
+    @{ Switch = $ReplacePath;                    Values = $Path;                    Name = '-ReplacePath requires -Path'                                           }
+    @{ Switch = $ReplaceHash;                    Values = $Hash;                    Name = '-ReplaceHash requires -Hash'                                           }
+    @{ Switch = $ReplaceOSUser;                  Values = $OSUser;                  Name = '-ReplaceOSUser requires -OSUser'                                       }
+    @{ Switch = $ReplaceMachineAddress;          Values = $MachineAddress;          Name = '-ReplaceMachineAddress requires -MachineAddress'                       }
+    @{ Switch = $ReplaceCertificateSerialNumber; Values = $CertificateSerialNumber; Name = '-ReplaceCertificateSerialNumber requires -CertificateSerialNumber'     }
+    @{ Switch = $ReplaceCertificateAttr;         Values = ($CertificateIssuer + $CertificateSubject + $CertificateSubjectAlternativeName); Name = '-ReplaceCertificateAttr requires at least one of -CertificateIssuer, -CertificateSubject, or -CertificateSubjectAlternativeName' }
+)
+
+foreach ($guard in $replaceGuards) {
+    if ($guard.Switch -and (-not $guard.Values -or $guard.Values.Count -eq 0)) {
+        Write-Log 'ERROR' $guard.Name
+        exit 1
+    }
 }
 
-# Import psPAS into the current session
-Import-Module psPAS -ErrorAction Stop
+#endregion
 
-# Build requested authentication methods
+#region --- Build Requested Auth Methods List ---
 
-# Path authentication
+# Path
 if ($Path) {
     foreach ($p in $Path) {
         if (-not [string]::IsNullOrWhiteSpace($p)) {
             $authMethodsToAdd += @{
-                Type   = 'Path'
-                Object = @{
+                Type    = 'Path'
+                Replace = $ReplacePath.IsPresent
+                Object  = @{
                     path                 = $p.Trim()
                     IsFolder             = $PathIsFolder
                     AllowInternalScripts = $PathAllowInternalScripts
@@ -283,104 +350,96 @@ if ($Path) {
     }
 }
 
-# Hash authentication
+# Hash
 if ($Hash) {
     foreach ($h in $Hash) {
         if (-not [string]::IsNullOrWhiteSpace($h)) {
-            $authObj = @{
-                hash = $h.Trim()
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($HashComment)) {
-                $authObj['Comment'] = $HashComment.Trim()
-            }
-
+            $authObj = @{ hash = $h.Trim() }
+            if (-not [string]::IsNullOrWhiteSpace($HashComment)) { $authObj['Comment'] = $HashComment.Trim() }
             $authMethodsToAdd += @{
-                Type   = 'Hash'
-                Object = $authObj
+                Type    = 'Hash'
+                Replace = $ReplaceHash.IsPresent
+                Object  = $authObj
             }
         }
     }
 }
 
-# OS User authentication
+# OS User
 if ($OSUser) {
     foreach ($user in $OSUser) {
         if (-not [string]::IsNullOrWhiteSpace($user)) {
             $authMethodsToAdd += @{
-                Type   = 'OSUser'
-                Object = @{
-                    osUser = $user.Trim()
-                }
+                Type    = 'OSUser'
+                Replace = $ReplaceOSUser.IsPresent
+                Object  = @{ osUser = $user.Trim() }
             }
         }
     }
 }
 
-# Machine Address authentication
+# Machine Address
 if ($MachineAddress) {
     foreach ($addr in $MachineAddress) {
         if (-not [string]::IsNullOrWhiteSpace($addr)) {
             $authMethodsToAdd += @{
-                Type   = 'MachineAddress'
-                Object = @{
-                    machineAddress = $addr.Trim()
-                }
+                Type    = 'MachineAddress'
+                Replace = $ReplaceMachineAddress.IsPresent
+                Object  = @{ machineAddress = $addr.Trim() }
             }
         }
     }
 }
 
-# Certificate Serial Number authentication
+# Certificate Serial Number
 if ($CertificateSerialNumber) {
     foreach ($serial in $CertificateSerialNumber) {
         if (-not [string]::IsNullOrWhiteSpace($serial)) {
-            $authObj = @{
-                certificateserialnumber = $serial.Trim()
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($CertificateSerialNumberComment)) {
-                $authObj['Comment'] = $CertificateSerialNumberComment.Trim()
-            }
-
+            $authObj = @{ certificateserialnumber = $serial.Trim() }
+            if (-not [string]::IsNullOrWhiteSpace($CertificateSerialNumberComment)) { $authObj['Comment'] = $CertificateSerialNumberComment.Trim() }
             $authMethodsToAdd += @{
-                Type   = 'CertificateSerialNumber'
-                Object = $authObj
+                Type    = 'CertificateSerialNumber'
+                Replace = $ReplaceCertificateSerialNumber.IsPresent
+                Object  = $authObj
             }
         }
     }
 }
 
-# Certificate Attributes authentication
+# Certificate Attributes
 if ($CertificateIssuer -or $CertificateSubject -or $CertificateSubjectAlternativeName) {
     $authObj = @{}
-
-    # Normalize arrays before sending and duplicate checks
-    $issuerValues = @(Normalize-StringArray -Values $CertificateIssuer)
+    $issuerValues  = @(Normalize-StringArray -Values $CertificateIssuer)
     $subjectValues = @(Normalize-StringArray -Values $CertificateSubject)
-    $sanValues = @(Normalize-StringArray -Values $CertificateSubjectAlternativeName)
+    $sanValues     = @(Normalize-StringArray -Values $CertificateSubjectAlternativeName)
 
-    if ($issuerValues.Count -gt 0) {
-        $authObj['Issuer'] = $issuerValues
-    }
-
-    if ($subjectValues.Count -gt 0) {
-        $authObj['Subject'] = $subjectValues
-    }
-
-    if ($sanValues.Count -gt 0) {
-        $authObj['SubjectAlternativeName'] = $sanValues
-    }
+    if ($issuerValues.Count -gt 0)  { $authObj['Issuer']                    = $issuerValues  }
+    if ($subjectValues.Count -gt 0) { $authObj['Subject']                   = $subjectValues }
+    if ($sanValues.Count -gt 0)     { $authObj['SubjectAlternativeName']     = $sanValues     }
 
     $authMethodsToAdd += @{
-        Type   = 'CertificateAttr'
-        Object = $authObj
+        Type    = 'CertificateAttr'
+        Replace = $ReplaceCertificateAttr.IsPresent
+        Object  = $authObj
     }
 }
 
-# Authentication / session handling
+#endregion
+
+#region --- Module Check ---
+
+if (-not (Get-Module -ListAvailable -Name psPAS)) {
+    Write-Log 'ERROR' 'psPAS module is not installed or not available.'
+    exit 1
+}
+
+Import-Module psPAS -ErrorAction Stop
+
+#endregion
+
+#region --- Authentication ---
+
 if ($null -ne $LogonToken) {
-    # Reuse caller-provided psPAS session
     try {
         Use-PASSession -Session $LogonToken
         $shouldLogoff = $false
@@ -390,11 +449,9 @@ if ($null -ne $LogonToken) {
         exit 1
     }
 } else {
-    # Prompt if credential not supplied
     if (-not $Credential) {
         $Credential = Get-Credential -Message 'Enter CyberArk credentials'
     }
-
     if (-not $Credential) {
         Write-Log 'ERROR' 'Credentials are required to proceed.'
         exit 1
@@ -402,7 +459,6 @@ if ($null -ne $LogonToken) {
 
     Write-Log 'INFO' ("Authenticating with psPAS using {0}..." -f $AuthenticationType)
 
-    # Build New-PASSession parameters
     $sessionParams = @{
         BaseURI          = $PVWAUrl
         Credential       = $Credential
@@ -410,17 +466,9 @@ if ($null -ne $LogonToken) {
         SkipVersionCheck = $true
     }
 
-    # Optional certificate validation bypass
-    if ($DisableCertificateValidation) {
-        $sessionParams['SkipCertificateCheck'] = $true
-    }
+    if ($DisableCertificateValidation) { $sessionParams['SkipCertificateCheck'] = $true }
+    if ($AuthenticationType -eq 'radius') { $sessionParams['OTP'] = $OTP }
 
-    # Add OTP only for RADIUS
-    if ($AuthenticationType -eq 'radius') {
-        $sessionParams['OTP'] = $OTP
-    }
-
-    # Create a new psPAS session
     try {
         $null = New-PASSession @sessionParams
         Write-Log 'INFO' 'Authentication successful.'
@@ -430,7 +478,10 @@ if ($null -ne $LogonToken) {
     }
 }
 
-# Validate application exists
+#endregion
+
+#region --- Validate Application Exists ---
+
 Write-Log 'INFO' ("Validating application '{0}' exists..." -f $AppID)
 
 try {
@@ -441,235 +492,271 @@ try {
     $exitCode = 1
 }
 
-# If no auth methods were requested, treat as verify-only mode
+#endregion
+
+#region --- Verify-Only Mode ---
+
 if ($exitCode -eq 0 -and $authMethodsToAdd.Count -eq 0) {
     Write-Log 'INFO' 'No authentication methods were specified. Verification only completed successfully.'
 }
 
-# Read existing authentication methods
+#endregion
+
+#region --- Retrieve Existing Auth Methods ---
+
 if ($exitCode -eq 0 -and $authMethodsToAdd.Count -gt 0) {
     Write-Log 'INFO' ("Retrieving existing authentication methods for application '{0}'..." -f $AppID)
 
     try {
         $result = Get-PASApplicationAuthenticationMethod -AppID $AppID
-        if ($null -ne $result) {
-            $existingAuthMethods = @($result)
-        } else {
-            $existingAuthMethods = @()
-        }
+        $existingAuthMethods = if ($null -ne $result) { @($result) } else { @() }
+        Write-Log 'INFO' ("Found {0} existing authentication method(s)." -f $existingAuthMethods.Count)
     } catch {
         Write-Log 'ERROR' ("Could not retrieve existing authentication methods: {0}" -f $_.Exception.Message)
         $exitCode = 1
     }
 }
 
-# Add authentication methods
+#endregion
+
+#region --- Delete Phase (Replace switches) ---
+#
+# For each type that has a Replace switch set, delete ALL existing entries of that type
+# before any adds are attempted. Each type is only purged once even if multiple values
+# of that type are in $authMethodsToAdd.
+
 if ($exitCode -eq 0 -and $authMethodsToAdd.Count -gt 0) {
-    foreach ($authMethod in $authMethodsToAdd) {
-        $authType = $authMethod.Type
-        $authObj = $authMethod.Object
-        $isDuplicate = $false
 
-        # Check for duplicates before add
-        foreach ($existing in $existingAuthMethods) {
-            if ($authType -eq 'CertificateAttr' -and (Normalize-Scalar $existing.AuthType) -eq 'certificateattr') {
-                # Certificate attributes use array comparisons
-                $existingSubject = @()
-                $existingIssuer = @()
-                $existingSAN = @()
+    # Collect the unique types that need replacing
+    $typesToReplace = $authMethodsToAdd |
+        Where-Object { $_.Replace -eq $true } |
+        Select-Object -ExpandProperty Type -Unique
 
-                if ($existing.Subject) { $existingSubject = @($existing.Subject) }
-                if ($existing.Issuer) { $existingIssuer = @($existing.Issuer) }
-                if ($existing.SubjectAlternativeName) { $existingSAN = @($existing.SubjectAlternativeName) }
+    foreach ($replaceType in $typesToReplace) {
 
-                $subjectMatches = Compare-NormalizedStringArrays -Left $authObj.Subject -Right $existingSubject
-                $issuerMatches = Compare-NormalizedStringArrays -Left $authObj.Issuer -Right $existingIssuer
-                $sanMatches = Compare-NormalizedStringArrays -Left $authObj.SubjectAlternativeName -Right $existingSAN
+        # Normalised API AuthType string as returned by Get-PASApplicationAuthenticationMethod
+        $apiTypeLower = $replaceType.ToLowerInvariant()
 
-                if ($subjectMatches -and $issuerMatches -and $sanMatches) {
-                    $isDuplicate = $true
-                    break
-                }
-            } else {
-                # All other types compare AuthType + AuthValue
-                if ((Normalize-Scalar $existing.AuthType) -eq 'path' -and $authType -eq 'Path' -and
-                    (Normalize-Scalar $existing.AuthValue) -eq (Normalize-Scalar $authObj.path)) {
-                    $isDuplicate = $true
-                    break
-                }
-
-                if ((Normalize-Scalar $existing.AuthType) -eq 'hash' -and $authType -eq 'Hash' -and
-                    (Normalize-Scalar $existing.AuthValue) -eq (Normalize-Scalar $authObj.hash)) {
-                    $isDuplicate = $true
-                    break
-                }
-
-                if ((Normalize-Scalar $existing.AuthType) -eq 'osuser' -and $authType -eq 'OSUser' -and
-                    (Normalize-Scalar $existing.AuthValue) -eq (Normalize-Scalar $authObj.osUser)) {
-                    $isDuplicate = $true
-                    break
-                }
-
-                if ((Normalize-Scalar $existing.AuthType) -eq 'machineaddress' -and $authType -eq 'MachineAddress' -and
-                    (Normalize-Scalar $existing.AuthValue) -eq (Normalize-Scalar $authObj.machineAddress)) {
-                    $isDuplicate = $true
-                    break
-                }
-
-                if ((Normalize-Scalar $existing.AuthType) -eq 'certificateserialnumber' -and $authType -eq 'CertificateSerialNumber' -and
-                    (Normalize-Scalar $existing.AuthValue) -eq (Normalize-Scalar $authObj.certificateserialnumber)) {
-                    $isDuplicate = $true
-                    break
-                }
-            }
+        $toDelete = $existingAuthMethods | Where-Object {
+            (Normalize-Scalar $_.AuthType) -eq $apiTypeLower
         }
 
-        # Friendly value for output
-        $displayValue = 'Certificate Attributes'
-        if ($authType -eq 'Path') { $displayValue = $authObj.path }
-        if ($authType -eq 'Hash') { $displayValue = $authObj.hash }
-        if ($authType -eq 'OSUser') { $displayValue = $authObj.osUser }
-        if ($authType -eq 'MachineAddress') { $displayValue = $authObj.machineAddress }
-        if ($authType -eq 'CertificateSerialNumber') { $displayValue = $authObj.certificateserialnumber }
-
-        if ($isDuplicate) {
-            $skippedAuths += ("{0}: {1} (duplicate)" -f $authType, $displayValue)
-            Write-Log 'INFO' ("Skipping {0} authentication. Already exists: {1}" -f $authType, $displayValue)
+        if (-not $toDelete -or @($toDelete).Count -eq 0) {
+            Write-Log 'INFO' ("Replace requested for type '{0}' but no existing entries found — nothing to delete." -f $replaceType)
             continue
         }
 
-        # Add each authentication method using the relevant psPAS parameter set
-        try {
-            Write-Log 'INFO' ("Adding {0} authentication: {1}" -f $authType, $displayValue)
+        foreach ($entry in @($toDelete)) {
+            $authID       = $entry.authID
+            $displayValue = if ($entry.AuthValue) { $entry.AuthValue } else { "(Certificate Attributes ID: $authID)" }
 
-            if ($authType -eq 'Path') {
-                $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -path $authObj.path -IsFolder $authObj.IsFolder -AllowInternalScripts $authObj.AllowInternalScripts
+            Write-Log 'INFO' ("Deleting existing {0} authentication entry (AuthID: {1}, Value: {2})..." -f $replaceType, $authID, $displayValue)
+
+            try {
+                Remove-PASApplicationAuthenticationMethod -AppID $AppID -AuthID $authID
+                $deletedAuths += ("{0}: {1} (AuthID: {2})" -f $replaceType, $displayValue, $authID)
+                Write-Log 'INFO' ("Deleted {0} authentication entry (AuthID: {1})." -f $replaceType, $authID)
+            } catch {
+                Write-Log 'ERROR' ("Failed to delete {0} authentication entry (AuthID: {1}): {2}" -f $replaceType, $authID, $_.Exception.Message)
+                $failedAuths += ("DELETE {0}: {1} - {2}" -f $replaceType, $displayValue, $_.Exception.Message)
+                $exitCode = 1
             }
+        }
 
-            if ($authType -eq 'Hash') {
-                if ($authObj.ContainsKey('Comment')) {
-                    $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -hash $authObj.hash -Comment $authObj.Comment
-                } else {
-                    $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -hash $authObj.hash
-                }
+        # Refresh the in-memory list so the add-phase duplicate check reflects deletions
+        if ($exitCode -eq 0) {
+            $existingAuthMethods = $existingAuthMethods | Where-Object {
+                (Normalize-Scalar $_.AuthType) -ne $apiTypeLower
             }
-
-            if ($authType -eq 'OSUser') {
-                $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -osUser $authObj.osUser
-            }
-
-            if ($authType -eq 'MachineAddress') {
-                $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -machineAddress $authObj.machineAddress
-            }
-
-            if ($authType -eq 'CertificateSerialNumber') {
-                if ($authObj.ContainsKey('Comment')) {
-                    $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -certificateserialnumber $authObj.certificateserialnumber -Comment $authObj.Comment
-                } else {
-                    $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -certificateserialnumber $authObj.certificateserialnumber
-                }
-            }
-
-            if ($authType -eq 'CertificateAttr') {
-                $addAttrParams = @{
-                    AppID = $AppID
-                }
-
-                if ($authObj.ContainsKey('Subject')) { $addAttrParams['Subject'] = $authObj.Subject }
-                if ($authObj.ContainsKey('Issuer')) { $addAttrParams['Issuer'] = $authObj.Issuer }
-                if ($authObj.ContainsKey('SubjectAlternativeName')) { $addAttrParams['SubjectAlternativeName'] = $authObj.SubjectAlternativeName }
-
-                $null = Add-PASApplicationAuthenticationMethod @addAttrParams
-            }
-
-            $addedAuths += ("{0}: {1}" -f $authType, $displayValue)
-            Write-Log 'INFO' ("Successfully added {0} authentication: {1}" -f $authType, $displayValue)
-        } catch {
-            $failedAuths += ("{0}: {1} - {2}" -f $authType, $displayValue, $_.Exception.Message)
-            Write-Log 'ERROR' ("Failed to add {0} authentication: {1}" -f $authType, $_.Exception.Message)
+            if ($null -eq $existingAuthMethods) { $existingAuthMethods = @() }
         }
     }
 }
 
-# Summary
+#endregion
+
+#region --- Add Phase ---
+
+if ($exitCode -eq 0 -and $authMethodsToAdd.Count -gt 0) {
+
+    foreach ($authMethod in $authMethodsToAdd) {
+        $authType    = $authMethod.Type
+        $authObj     = $authMethod.Object
+        $isDuplicate = $false
+
+        # Friendly display value for log messages
+        $displayValue = switch ($authType) {
+            'Path'                  { $authObj.path }
+            'Hash'                  { $authObj.hash }
+            'OSUser'                { $authObj.osUser }
+            'MachineAddress'        { $authObj.machineAddress }
+            'CertificateSerialNumber' { $authObj.certificateserialnumber }
+            default                 { 'Certificate Attributes' }
+        }
+
+        # Duplicate check against (already-updated) $existingAuthMethods
+        foreach ($existing in $existingAuthMethods) {
+            $existingTypeLower = Normalize-Scalar $existing.AuthType
+
+            if ($authType -eq 'CertificateAttr' -and $existingTypeLower -eq 'certificateattr') {
+                $existingSubject = if ($existing.Subject) { @($existing.Subject) } else { @() }
+                $existingIssuer  = if ($existing.Issuer)  { @($existing.Issuer)  } else { @() }
+                $existingSAN     = if ($existing.SubjectAlternativeName) { @($existing.SubjectAlternativeName) } else { @() }
+
+                if ((Compare-NormalizedStringArrays -Left $authObj.Subject -Right $existingSubject) -and
+                    (Compare-NormalizedStringArrays -Left $authObj.Issuer  -Right $existingIssuer)  -and
+                    (Compare-NormalizedStringArrays -Left $authObj.SubjectAlternativeName -Right $existingSAN)) {
+                    $isDuplicate = $true
+                    break
+                }
+            } else {
+                $matchMap = @{
+                    'Path'                    = @{ ApiType = 'path';                    Key = 'path'                    }
+                    'Hash'                    = @{ ApiType = 'hash';                    Key = 'hash'                    }
+                    'OSUser'                  = @{ ApiType = 'osuser';                  Key = 'osUser'                  }
+                    'MachineAddress'          = @{ ApiType = 'machineaddress';          Key = 'machineAddress'          }
+                    'CertificateSerialNumber' = @{ ApiType = 'certificateserialnumber'; Key = 'certificateserialnumber' }
+                }
+
+                if ($matchMap.ContainsKey($authType)) {
+                    $map = $matchMap[$authType]
+                    if ($existingTypeLower -eq $map.ApiType -and
+                        (Normalize-Scalar $existing.AuthValue) -eq (Normalize-Scalar $authObj[$map.Key])) {
+                        $isDuplicate = $true
+                        break
+                    }
+                }
+            }
+        }
+
+        if ($isDuplicate) {
+            $skippedAuths += ("{0}: {1} (duplicate)" -f $authType, $displayValue)
+            Write-Log 'INFO' ("Skipping {0} authentication — already exists: {1}" -f $authType, $displayValue)
+            continue
+        }
+
+        # Add the entry
+        try {
+            Write-Log 'INFO' ("Adding {0} authentication: {1}" -f $authType, $displayValue)
+
+            switch ($authType) {
+                'Path' {
+                    $null = Add-PASApplicationAuthenticationMethod -AppID $AppID `
+                        -path $authObj.path `
+                        -IsFolder $authObj.IsFolder `
+                        -AllowInternalScripts $authObj.AllowInternalScripts
+                }
+                'Hash' {
+                    if ($authObj.ContainsKey('Comment')) {
+                        $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -hash $authObj.hash -Comment $authObj.Comment
+                    } else {
+                        $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -hash $authObj.hash
+                    }
+                }
+                'OSUser' {
+                    $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -osUser $authObj.osUser
+                }
+                'MachineAddress' {
+                    $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -machineAddress $authObj.machineAddress
+                }
+                'CertificateSerialNumber' {
+                    if ($authObj.ContainsKey('Comment')) {
+                        $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -certificateserialnumber $authObj.certificateserialnumber -Comment $authObj.Comment
+                    } else {
+                        $null = Add-PASApplicationAuthenticationMethod -AppID $AppID -certificateserialnumber $authObj.certificateserialnumber
+                    }
+                }
+                'CertificateAttr' {
+                    $addAttrParams = @{ AppID = $AppID }
+                    if ($authObj.ContainsKey('Subject'))                { $addAttrParams['Subject']                   = $authObj.Subject                   }
+                    if ($authObj.ContainsKey('Issuer'))                 { $addAttrParams['Issuer']                    = $authObj.Issuer                    }
+                    if ($authObj.ContainsKey('SubjectAlternativeName')) { $addAttrParams['SubjectAlternativeName']     = $authObj.SubjectAlternativeName     }
+                    $null = Add-PASApplicationAuthenticationMethod @addAttrParams
+                }
+            }
+
+            $addedAuths += ("{0}: {1}" -f $authType, $displayValue)
+            Write-Log 'INFO' ("Successfully added {0} authentication: {1}" -f $authType, $displayValue)
+
+        } catch {
+            $failedAuths += ("ADD {0}: {1} - {2}" -f $authType, $displayValue, $_.Exception.Message)
+            Write-Log 'ERROR' ("Failed to add {0} authentication '{1}': {2}" -f $authType, $displayValue, $_.Exception.Message)
+        }
+    }
+}
+
+#endregion
+
+#region --- Summary ---
+
 Write-Output ''
 Write-Output ('=' * 80)
 Write-Output 'SUMMARY'
 Write-Output ('=' * 80)
 
+if ($deletedAuths.Count -gt 0) {
+    Write-Output ''
+    Write-Log 'INFO' ("Deleted {0} authentication method(s) (replace operation):" -f $deletedAuths.Count)
+    foreach ($auth in $deletedAuths) { Write-Output ("  - {0}" -f $auth) }
+}
+
 if ($addedAuths.Count -gt 0) {
     Write-Output ''
     Write-Log 'INFO' ("Added {0} authentication method(s):" -f $addedAuths.Count)
-    foreach ($auth in $addedAuths) {
-        Write-Output ("  - {0}" -f $auth)
-    }
+    foreach ($auth in $addedAuths) { Write-Output ("  - {0}" -f $auth) }
 }
 
 if ($skippedAuths.Count -gt 0) {
     Write-Output ''
     Write-Log 'INFO' ("Skipped {0} authentication method(s):" -f $skippedAuths.Count)
-    foreach ($auth in $skippedAuths) {
-        Write-Output ("  - {0}" -f $auth)
-    }
+    foreach ($auth in $skippedAuths) { Write-Output ("  - {0}" -f $auth) }
 }
 
 if ($failedAuths.Count -gt 0) {
     Write-Output ''
     Write-Log 'ERROR' ("Failed {0} authentication method(s):" -f $failedAuths.Count)
-    foreach ($auth in $failedAuths) {
-        Write-Output ("  - {0}" -f $auth)
-    }
+    foreach ($auth in $failedAuths) { Write-Output ("  - {0}" -f $auth) }
     $exitCode = 1
 }
 
-# Display updated authentication list
-if ($exitCode -eq 0 -and $addedAuths.Count -gt 0) {
-    Write-Log 'INFO' 'Retrieving updated authentication methods...'
+#endregion
+
+#region --- Display Final Auth Method List ---
+
+if ($exitCode -eq 0 -and ($addedAuths.Count -gt 0 -or $deletedAuths.Count -gt 0)) {
+    Write-Log 'INFO' 'Retrieving final authentication methods...'
 
     try {
-        $authMethods = Get-PASApplicationAuthenticationMethod -AppID $AppID
+        $finalMethods = Get-PASApplicationAuthenticationMethod -AppID $AppID
 
-        if ($authMethods) {
-            $authMethods = @($authMethods)
-
+        if ($finalMethods) {
+            $finalMethods = @($finalMethods)
             Write-Output ''
-            Write-Log 'INFO' ("Application '{0}' now has {1} authentication method(s):" -f $AppID, $authMethods.Count)
+            Write-Log 'INFO' ("Application '{0}' now has {1} authentication method(s):" -f $AppID, $finalMethods.Count)
             Write-Output ('=' * 80)
 
-            foreach ($auth in $authMethods) {
-                Write-Output ("  - Auth ID: {0} | Type: {1}" -f $auth.authID, $auth.AuthType)
-
-                if ($auth.AuthValue) {
-                    Write-Output ("    Value: {0}" -f $auth.AuthValue)
-                }
-                if ($auth.Subject) {
-                    Write-Output ("    Subject: {0}" -f (@($auth.Subject) -join '; '))
-                }
-                if ($auth.Issuer) {
-                    Write-Output ("    Issuer: {0}" -f (@($auth.Issuer) -join '; '))
-                }
-                if ($auth.SubjectAlternativeName) {
-                    Write-Output ("    SubjectAlternativeName: {0}" -f (@($auth.SubjectAlternativeName) -join '; '))
-                }
-                if ($auth.Comment) {
-                    Write-Output ("    Comment: {0}" -f $auth.Comment)
-                }
-                if ($null -ne $auth.IsFolder) {
-                    Write-Output ("    IsFolder: {0}" -f $auth.IsFolder)
-                }
-                if ($null -ne $auth.AllowInternalScripts) {
-                    Write-Output ("    AllowInternalScripts: {0}" -f $auth.AllowInternalScripts)
-                }
+            foreach ($auth in $finalMethods) {
+                Write-Output ("  - AuthID: {0} | Type: {1}" -f $auth.authID, $auth.AuthType)
+                if ($auth.AuthValue)                 { Write-Output ("    Value                  : {0}" -f $auth.AuthValue) }
+                if ($auth.Subject)                   { Write-Output ("    Subject                : {0}" -f (@($auth.Subject) -join '; ')) }
+                if ($auth.Issuer)                    { Write-Output ("    Issuer                 : {0}" -f (@($auth.Issuer) -join '; ')) }
+                if ($auth.SubjectAlternativeName)    { Write-Output ("    SubjectAlternativeName : {0}" -f (@($auth.SubjectAlternativeName) -join '; ')) }
+                if ($auth.Comment)                   { Write-Output ("    Comment                : {0}" -f $auth.Comment) }
+                if ($null -ne $auth.IsFolder)        { Write-Output ("    IsFolder               : {0}" -f $auth.IsFolder) }
+                if ($null -ne $auth.AllowInternalScripts) { Write-Output ("    AllowInternalScripts   : {0}" -f $auth.AllowInternalScripts) }
             }
 
             Write-Output ('=' * 80)
         }
     } catch {
-        Write-Log 'WARN' ("Could not retrieve updated authentication methods: {0}" -f $_.Exception.Message)
+        Write-Log 'WARN' ("Could not retrieve final authentication methods: {0}" -f $_.Exception.Message)
     }
 }
 
-# Logoff if we created the session
+#endregion
+
+#region --- Session Cleanup ---
+
 if ($shouldLogoff) {
     try {
         Write-Log 'INFO' 'Logging off...'
@@ -682,7 +769,6 @@ if ($shouldLogoff) {
     Write-Log 'INFO' 'psPAS session was provided. Not logging off.'
 }
 
-# Clear sensitive variable reference
 $Credential = $null
 
 exit $exitCode
