@@ -1,9 +1,9 @@
-﻿<#
+<#
 .SYNOPSIS
     Retrieves authentication methods for a CyberArk Application.
 
 .DESCRIPTION
-    This script authenticates to CyberArk and retrieves all authentication
+    This script authenticates to CyberArk via psPAS and retrieves all authentication
     methods configured for a specified application.
 
 .PARAMETER PVWAUrl
@@ -56,23 +56,6 @@ param(
     $logonToken
 )
 
-# Disable certificate validation if requested (NOT recommended for production)
-if ($DisableCertificateValidation) {
-    Write-Warning "Certificate validation is disabled. This should only be used for testing!"
-    add-type @"
-        using System.Net;
-        using System.Security.Cryptography.X509Certificates;
-        public class TrustAllCertsPolicy : ICertificatePolicy {
-            public bool CheckValidationResult(
-                ServicePoint srvPoint, X509Certificate certificate,
-                WebRequest request, int certificateProblem) {
-                return true;
-            }
-        }
-"@
-    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-}
-
 # Set TLS to 1.2 or higher
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -80,11 +63,7 @@ if ($DisableCertificateValidation) {
 $shouldLogoff = $true
 if ($logonToken) {
     Write-Output 'Using provided session token...'
-    if ($logonToken.GetType().name -eq 'String') {
-        $sessionToken = $logonToken
-    } else {
-        $sessionToken = $logonToken
-    }
+    Use-PASSession $logonToken
     $shouldLogoff = $false
     Write-Output 'Session token accepted. Will NOT log off at end.'
 } else {
@@ -96,64 +75,46 @@ if ($logonToken) {
         }
     }
 
-    # Extract username and password from credential object
-    $Username = $Credential.UserName
-    $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
-    $PlainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
-
     Write-Output "Authenticating to CyberArk using $AuthenticationType..."
 
-    # Prepare authentication request
-    $authUrl = "$PVWAUrl/API/Auth/$AuthenticationType/Logon"
-    $authBody = @{
-        username          = $Username
-        password          = $PlainPassword
-        concurrentSession = $true
-    } | ConvertTo-Json
+    # Build New-PASSession parameters
+    $sessionParams = @{
+        BaseURI            = $PVWAUrl
+        Credential         = $Credential
+        type               = $AuthenticationType
+        concurrentSession  = $true
+    }
+
+    if ($DisableCertificateValidation) {
+        Write-Warning "Certificate validation is disabled. This should only be used for testing!"
+        $sessionParams['SkipCertificateCheck'] = $true
+    }
 
     # Add RADIUS OTP if provided
     if ($AuthenticationType -eq 'radius' -and $OTP) {
-        $authBodyObj = $authBody | ConvertFrom-Json
-        $authBodyObj.password = "$PlainPassword,$OTP"
-        $authBody = $authBodyObj | ConvertTo-Json
+        $sessionParams['OTP']         = $OTP
+        $sessionParams['OTPMode']     = 'append'
     }
-
-    Write-Verbose $authBody
 }
 
 try {
-    if (-not $logonToken) {
-        # Authenticate and get session token
-        $authResponse = Invoke-RestMethod -Uri $authUrl -Method Post -Body $authBody -ContentType 'application/json'
-        Write-Verbose $authResponse
-        $sessionToken = $authResponse
-
+    if ($shouldLogoff) {
+        New-PASSession @sessionParams
         Write-Output 'Authentication successful!'
     }
 
     # Retrieve authentication methods
     Write-Output "`nRetrieving authentication methods for application '$AppID'..."
 
-    # Prepare the API URL (remove any trailing slash from PVWAUrl)
-    $PVWAUrl = $PVWAUrl.TrimEnd('/')
-    $getAuthUrl = "$PVWAUrl/WebServices/PIMServices.svc/Applications/$AppID/Authentications/"
-    Write-Verbose "GET URL: $getAuthUrl"
-
-    # Prepare headers with session token
-    $headers = @{
-        'Authorization' = $sessionToken
-        'Content-Type'  = 'application/json'
-    }
-
-    $authMethods = Invoke-RestMethod -Uri $getAuthUrl -Method Get -Headers $headers
+    $authMethods = Get-PASApplicationAuthenticationMethod -AppID $AppID
     Write-Verbose ($authMethods | ConvertTo-Json -Depth 5)
 
     # Display all authentication methods
-    if ($authMethods.authentication) {
-        Write-Output "`nFound $($authMethods.authentication.Count) authentication method(s) for application '$AppID':"
-        Write-Output ("=" * 80)
+    if ($authMethods) {
+        $methodList = @($authMethods)
+        Write-Output "`nFound $($methodList.Count) authentication method(s) for application '$AppID':"
 
-        foreach ($auth in $authMethods.authentication) {
+        foreach ($auth in $methodList) {
             Write-Output "`n  - Auth ID: $($auth.authID) | Type: $($auth.AuthType)"
 
             if ($auth.AuthValue) {
@@ -179,20 +140,18 @@ try {
             }
         }
 
-        Write-Output "`n" # Extra line before separator
-        Write-Output ("=" * 80)
+        Write-Output ''
     } else {
         Write-Output "`nNo authentication methods found for application '$AppID'."
     }
 
     # Logoff (only if we authenticated in this script)
     if ($shouldLogoff) {
-        Write-Output "`nLogging off..."
-        $logoffUrl = "$PVWAUrl/API/Auth/Logoff"
-        Invoke-RestMethod -Uri $logoffUrl -Method Post -Headers $headers
+        Write-Output 'Logging off...'
+        Close-PASSession
         Write-Output 'Session closed successfully.'
     } else {
-        Write-Output "`nSession token was provided - NOT logging off."
+        Write-Output 'Session token was provided - NOT logging off.'
     }
 } catch {
     Write-Output "`nError occurred:"
@@ -204,26 +163,16 @@ try {
     }
 
     # Attempt to log off even if there was an error (only if we authenticated)
-    if ($sessionToken -and $shouldLogoff) {
+    if ($shouldLogoff) {
         try {
-            $logoffUrl = "$PVWAUrl/API/Auth/Logoff"
-            $headers = @{
-                'Authorization' = $sessionToken
-            }
-            Invoke-RestMethod -Uri $logoffUrl -Method Post -Headers $headers
+            Close-PASSession
             Write-Output 'Session closed.'
         } catch {
             Write-Output 'Could not close session properly.'
         }
-    } elseif (-not $shouldLogoff) {
+    } else {
         Write-Output 'Session token was provided - NOT logging off.'
     }
 
     exit 1
-} finally {
-    # Clear sensitive data from memory
-    if ($BSTR) {
-        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
-    }
-    $PlainPassword = $null
 }
