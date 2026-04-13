@@ -395,12 +395,26 @@ if ($exitCode -eq 0 -and $onboardAccount) {
     # Use the friendly account name so it is identifiable in the safe
     $accountParams['Name'] = $fullAppID
 
+    # Check if account already exists
+    $existingAccount = $null
     try {
-        $newAccount = Add-PASAccount @accountParams
-        Write-Log 'INFO' ("Vault account '{0}' onboarded successfully (AccountID: {1})." -f $fullAppID, $newAccount.id)
+        $existingAccount = Get-PASAccount -SafeName $SafeName.Trim() -search $fullAppID |
+            Where-Object { $_.UserName -eq $fullAppID }
     } catch {
-        Write-Log 'ERROR' ("Could not onboard vault account for '{0}': {1}" -f $fullAppID, $_.Exception.Message)
-        $exitCode = 1
+        $existingAccount = $null
+    }
+
+    if ($existingAccount) {
+        Write-Log 'INFO' ("Vault account '{0}' already exists in safe '{1}' (AccountID: {2}). Skipping onboard." -f $fullAppID, $SafeName.Trim(), $existingAccount.id)
+        $exitCode = 0
+    } else {
+        # proceed with Add-PASAccount as currently written
+        try {
+            $newAccount = Add-PASAccount @accountParams
+            Write-Log 'INFO' ("Vault account '{0}' onboarded successfully (AccountID: {1})." -f $fullAppID, $newAccount.id)
+        } catch {
+            Write-Log 'ERROR' ("Could not onboard vault account for '{0}': {1}" -f $fullAppID, $_.Exception.Message)
+        }
     }
 
     # Scrub the SecureString from memory
