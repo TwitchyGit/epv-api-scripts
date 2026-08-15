@@ -13,9 +13,11 @@ CyberArk PVWA v10.4 and above
 VERSION HISTORY:
 1.0 05/07/2018 - Initial release
 1.1 08/12/2018 - Added ability to do bulk export/import
+1.2 15/08/2026 - Windows PowerShell 5.1 compatibility and reliability fixes
 
 ########################################################################### #>
 
+[CmdletBinding()]
 param
 (
 	[Parameter(Mandatory = $true, HelpMessage = "Please enter your PVWA address (For example: https://pvwa.mydomain.com/PasswordVault)")]
@@ -69,6 +71,14 @@ param
 	$logonToken
 )
 
+# Normalize the base URL before constructing any API URLs. In the previous
+# version this happened after the URLs had already been built, which produced
+# double slashes when PVWAURL ended in "/".
+$PVWAURL = $PVWAURL.Trim().TrimEnd('/')
+if ([string]::IsNullOrWhiteSpace($PVWAURL)) {
+	throw "PVWAURL cannot be empty."
+}
+
 # Global URLS
 # -----------
 $URL_PVWAAPI = $PVWAURL + "/api"
@@ -87,12 +97,13 @@ $URL_ImportPlatforms = $URL_PVWAAPI + "/Platforms/Import"
 # ---------------------------
 $rstusername = $rstpassword = ""
 
-$global:InDebug = $PSBoundParameters.Debug.IsPresent
-$global:InVerbose = $PSBoundParameters.Verbose.IsPresent
+$global:InDebug = ($PSBoundParameters.ContainsKey('Debug') -and $PSBoundParameters['Debug'])
+$global:InVerbose = ($PSBoundParameters.ContainsKey('Verbose') -and $PSBoundParameters['Verbose'])
 
 $ScriptLocation = Split-Path -Parent $MyInvocation.MyCommand.Path
 $global:LOG_DATE = $(Get-Date -Format yyyyMMdd) + "-" + $(Get-Date -Format HHmmss)
-$global:LOG_FILE_PATH = "$ScriptLocation\Export-Import-Platform_$LOG_DATE.log"
+$global:LOG_FILE_PATH = Join-Path -Path $ScriptLocation -ChildPath "Export-Import-Platform_$LOG_DATE.log"
+$script:TokenWasProvided = $PSBoundParameters.ContainsKey('logonToken') -and -not [string]::IsNullOrEmpty($logonToken)
 
 #region Functions
 Function Test-CommandExists {
@@ -250,15 +261,16 @@ Function import-platform {
 	param(
 		[string]$PlatformZipPath
 	)
-	If (Test-Path $PlatformZipPath) {
+	If (Test-Path -LiteralPath $PlatformZipPath -PathType Leaf) {
 		Write-LogMessage -Type Debug -Msg "PlatformZipPath: `"$PlatformZipPath`""
-		$zipContent = [System.IO.File]::ReadAllBytes($(Resolve-Path $PlatformZipPath))
+		$resolvedZipPath = (Resolve-Path -LiteralPath $PlatformZipPath -ErrorAction Stop).ProviderPath
+		$zipContent = [System.IO.File]::ReadAllBytes($resolvedZipPath)
 		$importBody = @{ ImportFile = $zipContent; } | ConvertTo-Json -Depth 3 -Compress
-		Write-LogMessage -Type Debug -Msg "importBody first 50: $($importBody.Substring(0,50))"
+		Write-LogMessage -Type Debug -Msg "Import request body created ($($importBody.Length) characters)"
 		try {
-			$ImportPlatformResponse = Invoke-RestMethod -Method POST -Uri $URL_ImportPlatforms -Headers $logonHeader -ContentType "application/json" -TimeoutSec 2700 -Body $importBody
+			$ImportPlatformResponse = Invoke-RestMethod -Method POST -Uri $URL_ImportPlatforms -Headers $logonHeader -ContentType "application/json" -TimeoutSec 2700 -Body $importBody -ErrorAction Stop
 			# Get the Platform Name
-			$platformDetails = Invoke-RestMethod -Method Get -Uri $($URL_PlatformDetails -f $ImportPlatformResponse.PlatformID) -Headers $logonHeader -ContentType "application/json" -TimeoutSec 2700
+			$platformDetails = Invoke-RestMethod -Method Get -Uri $($URL_PlatformDetails -f $ImportPlatformResponse.PlatformID) -Headers $logonHeader -ContentType "application/json" -TimeoutSec 2700 -ErrorAction Stop
 			If ($platformDetails) {
 				Write-LogMessage -Type Debug -Msg "PlatformID: `"$($platformDetails.PlatformID)`""
 				Write-LogMessage -Type Debug -Msg "PlatformDetails: "
@@ -267,6 +279,7 @@ Function import-platform {
 				}
 				Write-LogMessage -Type Info -Msg "Platform named `"$($platformDetails.Details.PolicyName)`" with PlatformID `"$($platformDetails.PlatformID)`" was successfully imported and is $(if($platformDetails.Active) { "active" } else { "inactive" })"				
 			}		
+			return $true
 		} catch {
 			IF ($_ -match "ITAPS016E" ){
 				Write-LogMessage -Type Info -Msg "Platform in file `"$PlatformZipPath`" already exists. To update, delete existing version and import again."
@@ -281,7 +294,11 @@ Function import-platform {
 				}
 
 			}
+			return $false
 		}
+	} else {
+		Write-LogMessage -Type Error -Msg "Platform ZIP file does not exist: `"$PlatformZipPath`""
+		return $false
 	}
 } #end function Import
 
@@ -293,10 +310,15 @@ Function export-platform {
 
 	try {
 		$exportURL = $URL_ExportPlatforms -f $PlatformID
+		$exportPath = Join-Path -Path $PlatformZipPath -ChildPath ($PlatformID + ".zip")
 		Write-LogMessage -Type Debug -Msg "Using URL: $exportURL"
-		Write-LogMessage -Type Debug -Msg "Exporting to: $PlatformZipPath\$PlatformID.zip"
-		Invoke-RestMethod -Method POST -Uri $exportURL -Headers $logonHeader -ContentType "application/zip" -TimeoutSec 2700 -OutFile "$PlatformZipPath\$PlatformID.zip" -ErrorAction SilentlyContinue
+		Write-LogMessage -Type Debug -Msg "Exporting to: $exportPath"
+		Invoke-RestMethod -Method POST -Uri $exportURL -Headers $logonHeader -ContentType "application/zip" -TimeoutSec 2700 -OutFile $exportPath -ErrorAction Stop
+		if (-not (Test-Path -LiteralPath $exportPath -PathType Leaf) -or (Get-Item -LiteralPath $exportPath).Length -eq 0) {
+			throw "PVWA returned no platform ZIP content."
+		}
 		Write-LogMessage -Type Info -Msg "Successfully exported platform `"$PlatformID`""
+		return $true
 	} catch {
 		Write-LogMessage -Type Error -Msg "Error while attempting to export platformID `"$PlatformID`""
 		try {	
@@ -306,6 +328,7 @@ Function export-platform {
 		catch  {
 			Write-LogMessage -Type Error -Msg "Error `"$($Error[1].ErrorDetails.Message)`""
 		}
+		return $false
 	}
 } #end function Import
 
@@ -323,7 +346,7 @@ Function Get-PlatformsList {
 			$url = $URL_GetPlatforms + "?Active=True&PlatformType=Regular"
 		}
 		Write-LogMessage -Type Debug -Msg "Using URL: $url"
-		$result = Invoke-RestMethod -Method GET -Uri $url -Headers $logonHeader -ErrorAction SilentlyContinue
+		$result = Invoke-RestMethod -Method GET -Uri $url -Headers $logonHeader -ErrorAction Stop
 
 		foreach ($platform in $result.Platforms) {
 			$idList += $platform.general.id
@@ -370,14 +393,24 @@ If (Test-CommandExists Invoke-RestMethod) {
 		}
 	}
 
-	# Check that the PVWA URL is OK
-	If ($PVWAURL -ne "") {
-		If ($PVWAURL.Substring($PVWAURL.Length - 1) -eq "/") {
-			$PVWAURL = $PVWAURL.Substring(0, $PVWAURL.Length - 1)
-		}
-	} else {
-		Write-LogMessage -Type Info -Msg "PVWA URL can not be empty"
+	# Validate local inputs before prompting for credentials or opening a session.
+	$parsedPVWAUri = $null
+	if (-not [Uri]::TryCreate($PVWAURL, [UriKind]::Absolute, [ref]$parsedPVWAUri) -or
+		($parsedPVWAUri.Scheme -ne 'http' -and $parsedPVWAUri.Scheme -ne 'https')) {
+		Write-LogMessage -Type Error -Msg "PVWAURL must be an absolute HTTP or HTTPS URL."
 		return
+	}
+	if ($PsCmdlet.ParameterSetName -in @('Export', 'ExportFile', 'ExportActive', 'ExportAll')) {
+		if (-not (Test-Path -LiteralPath $PlatformZipPath -PathType Container)) {
+			Write-LogMessage -Type Error -Msg "Export directory does not exist: `"$PlatformZipPath`""
+			return
+		}
+	}
+	if ($PsCmdlet.ParameterSetName -in @('ImportFile', 'ExportFile')) {
+		if (-not (Test-Path -LiteralPath $listFile -PathType Leaf)) {
+			Write-LogMessage -Type Error -Msg "List file does not exist: `"$listFile`""
+			return
+		}
 	}
 
 	Write-LogMessage -Type Info -Msg "Export / Import Platform: Script Started"
@@ -399,7 +432,7 @@ If (Test-CommandExists Invoke-RestMethod) {
 			$creds = $Host.UI.PromptForCredential($caption, $msg, "", "")
 		}
 		if ($null -ne $creds) {
-			$rstusername = $creds.username.Replace('\', '')    
+			$rstusername = $creds.UserName
 			$rstpassword = $creds.GetNetworkCredential().password
 
 		} else {
@@ -413,9 +446,9 @@ If (Test-CommandExists Invoke-RestMethod) {
 		try {
 			# Logon
 			Write-LogMessage -Type Debug -Msg "Logon URL: $URL_Logon" 
-			Write-LogMessage -Type Debug -Msg "Logon Body: $logonBody" 
-			$logonToken = Invoke-RestMethod -Method Post -Uri $URL_Logon -Body $logonBody -ContentType "application/json"
-			Write-LogMessage -Type Debug -Msg "Logon token: $logonToken" 
+			Write-LogMessage -Type Debug -Msg "Logon request body omitted because it contains credentials"
+			$logonToken = Invoke-RestMethod -Method Post -Uri $URL_Logon -Body $logonBody -ContentType "application/json" -ErrorAction Stop
+			Write-LogMessage -Type Debug -Msg "Logon succeeded; token omitted from log"
 		} catch {
 			Write-LogMessage -Type Error -Msg $_.Exception.Response.StatusDescription
 			$logonToken = ""
@@ -434,7 +467,7 @@ If (Test-CommandExists Invoke-RestMethod) {
 	switch ($PsCmdlet.ParameterSetName) {
 		"Import" {
 			Write-LogMessage -Type Debug -Msg "In `"Import`" PlatformZipPath : $PlatformZipPath"
-			import-platform $PlatformZipPath -error
+			[void](import-platform $PlatformZipPath)
 		}
 
 		"ImportFile" {
@@ -442,7 +475,7 @@ If (Test-CommandExists Invoke-RestMethod) {
 			foreach ($line in Get-Content $listFile) {
 				Write-LogMessage -Type Verbose -Msg "Trying to import $line" 
 				if (![string]::IsNullOrEmpty($line)) {
-					import-platform $line 
+					[void](import-platform $line.Trim())
     }
 			} 
 		}
@@ -457,12 +490,15 @@ If (Test-CommandExists Invoke-RestMethod) {
 
 		"ExportFile" {
 			Write-LogMessage -Type Debug -Msg "In `"ExportFile`" PlatformZipPath : $PlatformZipPath"
-			$null | Out-File -FilePath "$PlatformZipPath\_Exported.txt" -Force
+			$exportManifest = Join-Path -Path $PlatformZipPath -ChildPath '_Exported.txt'
+			$null | Out-File -FilePath $exportManifest -Force
 			foreach ($line in Get-Content $listFile) {
-				Write-LogMessage -Type Verbose -Msg "Trying to export PlatformID `"$line`"" 
-				if (![string]::IsNullOrEmpty($line)) { 
-					export-platform $line
-					("$PlatformZipPath\$line.zip").Replace("\\", "\").Replace("/", "\") | Out-File -FilePath "$PlatformZipPath\_Exported.txt" -Append
+				$platformToExport = $line.Trim()
+				Write-LogMessage -Type Verbose -Msg "Trying to export PlatformID `"$platformToExport`"" 
+				if (![string]::IsNullOrEmpty($platformToExport)) {
+					if (export-platform $platformToExport) {
+						Join-Path -Path $PlatformZipPath -ChildPath ($platformToExport + '.zip') | Out-File -FilePath $exportManifest -Append
+					}
 				}
 			} 
 	
@@ -470,12 +506,14 @@ If (Test-CommandExists Invoke-RestMethod) {
 		{ ($_ -eq "ExportActive") -or ($_ -eq "ExportAll") } {
 			Write-LogMessage -Type Debug -Msg "In `"ExportActive or ExportAll`" PlatformZipPath : $PlatformZipPath"
 			$platforms = Get-PlatformsList -GetAll:$(($PsCmdlet.ParameterSetName -eq "ExportAll"))
-			$null | Out-File -FilePath "$PlatformZipPath\_Exported.txt" -Force
+			$exportManifest = Join-Path -Path $PlatformZipPath -ChildPath '_Exported.txt'
+			$null | Out-File -FilePath $exportManifest -Force
 			foreach ($line in $platforms) {
 				Write-LogMessage -Type Verbose -Msg "Trying to export PlatformID `"$line`"" 
 				if (![string]::IsNullOrEmpty($line)) { 
-					export-platform $line 
-					("$PlatformZipPath\$line.zip").Replace("\\", "\").Replace("/", "\") | Out-File -FilePath "$PlatformZipPath\_Exported.txt" -Append
+					if (export-platform $line) {
+						Join-Path -Path $PlatformZipPath -ChildPath ($line + '.zip') | Out-File -FilePath $exportManifest -Append
+					}
 				}		
 			} 
 
@@ -485,10 +523,14 @@ If (Test-CommandExists Invoke-RestMethod) {
 
 	# ------------------
 	Write-LogMessage -Type Info -Msg "Logoff Session..."
-	If ([string]::IsNullOrEmpty($logonToken)) {
+	If ($script:TokenWasProvided) {
 		Write-LogMessage -Type Info -Msg "LogonToken passed, session NOT logged off"
 	} else {
-		Invoke-RestMethod -Method Post -Uri $URL_Logoff -Headers $logonHeader -ContentType "application/json" | Out-Null
+		try {
+			Invoke-RestMethod -Method Post -Uri $URL_Logoff -Headers $logonHeader -ContentType "application/json" -ErrorAction Stop | Out-Null
+		} catch {
+			Write-LogMessage -Type Warning -Msg "Logoff failed: $($_.Exception.Message)"
+		}
 	}
 	
 } else {
