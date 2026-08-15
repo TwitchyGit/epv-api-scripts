@@ -13,14 +13,20 @@ CyberArk PVWA v10.4 and above
 VERSION HISTORY:
 1.0 05/07/2018 - Initial release
 1.1 08/12/2018 - Added ability to do bulk export/import
-1.2 15/08/2026 - Windows PowerShell 5.1 compatibility and reliability fixes
+1.2 15/08/2026 - Windows PowerShell 5.1 compatibility plus interactive mode and reliability fixes
 
 ########################################################################### #>
 
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Interactive')]
 param
 (
-	[Parameter(Mandatory = $true, HelpMessage = "Please enter your PVWA address (For example: https://pvwa.mydomain.com/PasswordVault)")]
+	[Parameter(ParameterSetName = 'Interactive', Mandatory = $false)]
+	[Parameter(ParameterSetName = 'Import', Mandatory = $true, HelpMessage = "Please enter your PVWA address (For example: https://pvwa.mydomain.com/PasswordVault)")]
+	[Parameter(ParameterSetName = 'Export', Mandatory = $true, HelpMessage = "Please enter your PVWA address (For example: https://pvwa.mydomain.com/PasswordVault)")]
+	[Parameter(ParameterSetName = 'ImportFile', Mandatory = $true, HelpMessage = "Please enter your PVWA address (For example: https://pvwa.mydomain.com/PasswordVault)")]
+	[Parameter(ParameterSetName = 'ExportFile', Mandatory = $true, HelpMessage = "Please enter your PVWA address (For example: https://pvwa.mydomain.com/PasswordVault)")]
+	[Parameter(ParameterSetName = 'ExportActive', Mandatory = $true, HelpMessage = "Please enter your PVWA address (For example: https://pvwa.mydomain.com/PasswordVault)")]
+	[Parameter(ParameterSetName = 'ExportAll', Mandatory = $true, HelpMessage = "Please enter your PVWA address (For example: https://pvwa.mydomain.com/PasswordVault)")]
 	#[ValidateScript({Invoke-WebRequest -UseBasicParsing -DisableKeepAlive -Uri $_ -Method 'Head' -ErrorAction 'stop' -TimeoutSec 30})]
 	[Alias("url")]
 	[String]$PVWAURL,
@@ -41,6 +47,7 @@ param
 
 	[Parameter(ParameterSetName = 'ExportActive', Mandatory = $true)][switch]$ExportActive,
 	[Parameter(ParameterSetName = 'ExportAll', Mandatory = $true)][switch]$ExportAll,
+	[Parameter(ParameterSetName = 'Interactive', Mandatory = $false)][switch]$Interactive,
 	
 	[Parameter(ParameterSetName = 'Export', Mandatory = $true, HelpMessage = "Enter the platform ID to export")]
 	[Alias("id")]
@@ -70,6 +77,63 @@ param
 	[Parameter(Mandatory = $false)]
 	$logonToken
 )
+
+$operationName = $PSCmdlet.ParameterSetName
+
+if ($operationName -eq 'Interactive') {
+	Write-Host ""
+	Write-Host "Export / Import Platform"
+	Write-Host "  1. Import one platform ZIP"
+	Write-Host "  2. Import platform ZIPs listed in a file"
+	Write-Host "  3. Export one platform"
+	Write-Host "  4. Export platforms listed in a file"
+	Write-Host "  5. Export all active regular platforms"
+	Write-Host "  6. Export all regular platforms"
+
+	do {
+		$operationChoice = Read-Host "Select an operation (1-6)"
+	} until ($operationChoice -in @('1', '2', '3', '4', '5', '6'))
+
+	$operationName = @{
+		'1' = 'Import'
+		'2' = 'ImportFile'
+		'3' = 'Export'
+		'4' = 'ExportFile'
+		'5' = 'ExportActive'
+		'6' = 'ExportAll'
+	}[$operationChoice]
+
+	do {
+		$PVWAURL = Read-Host "PVWA address (for example, https://pvwa.example.com/PasswordVault)"
+	} until (-not [string]::IsNullOrWhiteSpace($PVWAURL))
+
+	switch ($operationName) {
+		'Import' {
+			do { $PlatformZipPath = Read-Host "Platform ZIP file path" }
+			until (-not [string]::IsNullOrWhiteSpace($PlatformZipPath))
+		}
+		'ImportFile' {
+			do { $listFile = Read-Host "File containing platform ZIP paths" }
+			until (-not [string]::IsNullOrWhiteSpace($listFile))
+		}
+		'Export' {
+			do { $PlatformID = Read-Host "Platform ID" }
+			until (-not [string]::IsNullOrWhiteSpace($PlatformID))
+			do { $PlatformZipPath = Read-Host "Export directory" }
+			until (-not [string]::IsNullOrWhiteSpace($PlatformZipPath))
+		}
+		'ExportFile' {
+			do { $listFile = Read-Host "File containing platform IDs" }
+			until (-not [string]::IsNullOrWhiteSpace($listFile))
+			do { $PlatformZipPath = Read-Host "Export directory" }
+			until (-not [string]::IsNullOrWhiteSpace($PlatformZipPath))
+		}
+		{ $_ -in @('ExportActive', 'ExportAll') } {
+			do { $PlatformZipPath = Read-Host "Export directory" }
+			until (-not [string]::IsNullOrWhiteSpace($PlatformZipPath))
+		}
+	}
+}
 
 # Normalize the base URL before constructing any API URLs. In the previous
 # version this happened after the URLs had already been built, which produced
@@ -400,13 +464,13 @@ If (Test-CommandExists Invoke-RestMethod) {
 		Write-LogMessage -Type Error -Msg "PVWAURL must be an absolute HTTP or HTTPS URL."
 		return
 	}
-	if ($PsCmdlet.ParameterSetName -in @('Export', 'ExportFile', 'ExportActive', 'ExportAll')) {
+	if ($operationName -in @('Export', 'ExportFile', 'ExportActive', 'ExportAll')) {
 		if (-not (Test-Path -LiteralPath $PlatformZipPath -PathType Container)) {
 			Write-LogMessage -Type Error -Msg "Export directory does not exist: `"$PlatformZipPath`""
 			return
 		}
 	}
-	if ($PsCmdlet.ParameterSetName -in @('ImportFile', 'ExportFile')) {
+	if ($operationName -in @('ImportFile', 'ExportFile')) {
 		if (-not (Test-Path -LiteralPath $listFile -PathType Leaf)) {
 			Write-LogMessage -Type Error -Msg "List file does not exist: `"$listFile`""
 			return
@@ -464,7 +528,7 @@ If (Test-CommandExists Invoke-RestMethod) {
 		$logonHeader.Add("Authorization", $logonToken)
 		#endregion
 	}
-	switch ($PsCmdlet.ParameterSetName) {
+	switch ($operationName) {
 		"Import" {
 			Write-LogMessage -Type Debug -Msg "In `"Import`" PlatformZipPath : $PlatformZipPath"
 			[void](import-platform $PlatformZipPath)
@@ -505,7 +569,7 @@ If (Test-CommandExists Invoke-RestMethod) {
 		}
 		{ ($_ -eq "ExportActive") -or ($_ -eq "ExportAll") } {
 			Write-LogMessage -Type Debug -Msg "In `"ExportActive or ExportAll`" PlatformZipPath : $PlatformZipPath"
-			$platforms = Get-PlatformsList -GetAll:$(($PsCmdlet.ParameterSetName -eq "ExportAll"))
+			$platforms = Get-PlatformsList -GetAll:$(($operationName -eq "ExportAll"))
 			$exportManifest = Join-Path -Path $PlatformZipPath -ChildPath '_Exported.txt'
 			$null | Out-File -FilePath $exportManifest -Force
 			foreach ($line in $platforms) {
